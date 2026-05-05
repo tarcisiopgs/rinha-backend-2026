@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Dataset artifacts (large)
+/data/*.bin
+/data/*.gz
+/data/references.json
+!/data/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Profiling
+flamegraph.svg
+perf.data*
+*.profraw

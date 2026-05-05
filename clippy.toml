@@ -1,0 +1,4 @@
+avoid-breaking-exported-api = false
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "use monoio::time::sleep in async ctx" },
+]

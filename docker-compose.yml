@@ -1,0 +1,73 @@
+name: rinha-2026
+
+services:
+  api1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rinha-2026:latest
+    entrypoint: ["/usr/local/bin/api"]
+    environment:
+      API_SOCKET: /sockets/api1.sock
+      DATASET_PATH: /data/references.bin
+      RUST_LOG: warn
+    volumes:
+      - ./data:/data:ro
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "150MB"
+    networks:
+      - rinha
+
+  api2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rinha-2026:latest
+    entrypoint: ["/usr/local/bin/api"]
+    environment:
+      API_SOCKET: /sockets/api2.sock
+      DATASET_PATH: /data/references.bin
+      RUST_LOG: warn
+    volumes:
+      - ./data:/data:ro
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "150MB"
+    networks:
+      - rinha
+
+  lb:
+    image: rinha-2026:latest
+    entrypoint: ["/usr/local/bin/lb"]
+    environment:
+      LB_LISTEN: 0.0.0.0:9999
+      LB_UPSTREAMS: /sockets/api1.sock,/sockets/api2.sock
+      RUST_LOG: warn
+    ports:
+      - "9999:9999"
+    depends_on:
+      - api1
+      - api2
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: "50MB"
+    networks:
+      - rinha
+
+volumes:
+  sockets:
+
+networks:
+  rinha:
+    driver: bridge

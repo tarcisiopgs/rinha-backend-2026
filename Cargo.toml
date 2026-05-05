@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/api",
+    "crates/lb",
+    "crates/common",
+    "crates/preprocess",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/tarcisiopgs/rinha-backend-2026"
+
+[workspace.dependencies]
+common = { path = "crates/common" }
+
+monoio = { version = "0.2", features = ["sync", "iouring", "bytes"] }
+bytes = "1.8"
+memchr = "2.7"
+itoa = "1.0"
+ryu = "1.0"
+
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+memmap2 = "0.9"
+ahash = { version = "0.8", default-features = false, features = ["std"] }
+
+flate2 = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+perf = { level = "deny", priority = 0 }
+redundant_clone = "deny"
+needless_collect = "deny"
+large_enum_variant = "warn"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+[profile.release-debug]
+inherits = "release"
+debug = true
+strip = false
+
+[profile.bench]
+inherits = "release"
+debug = true
