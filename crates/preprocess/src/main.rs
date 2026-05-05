@@ -1,5 +1,5 @@
 //! Pré-processador offline. Lê `references.json.gz` (3M vetores rotulados) e
-//! produz `references.bin` no formato SoA i16 esperado pela API.
+//! produz `references.bin` no formato SoA f32 esperado pela API.
 //!
 //! Uso: `preprocess <input.json.gz> <output.bin>`
 
@@ -8,8 +8,10 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
-use common::dataset::{HEADER_SIZE, LABEL_FRAUD, LABEL_LEGIT, MAGIC, VERSION};
-use common::proto::{DIM, NULL_SENTINEL, QUANT_SCALE};
+use common::dataset::{
+    align_up, padded_n, ALIGN, HEADER_SIZE, LABEL_FRAUD, LABEL_LEGIT, MAGIC, VERSION,
+};
+use common::proto::{DIM, NULL_SENTINEL};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 
@@ -40,10 +42,19 @@ fn main() -> Result<()> {
     drop(buf);
 
     let n = refs.len();
-    eprintln!("carregados {n} vetores");
+    let n_padded = padded_n(n);
+    eprintln!("carregados {n} vetores (padded={n_padded})");
 
     let mut labels = vec![0_u8; n];
-    let mut soa = vec![0_i16; DIM * n];
+    let mut soa = vec![0.0_f32; DIM * n_padded];
+
+    // Posições padding (n..n_padded) recebem sentinela amplificada — distância
+    // pra qualquer query realista fica gigante, garantindo descarte pelo TopK.
+    for d in 0..DIM {
+        for i in n..n_padded {
+            soa[d * n_padded + i] = 1e9;
+        }
+    }
 
     let mut fraud_count = 0_usize;
     for (i, r) in refs.iter().enumerate() {
@@ -64,12 +75,7 @@ fn main() -> Result<()> {
 
         for d in 0..DIM {
             let value = r.vector[d];
-            soa[d * n + i] = if value < 0.0 {
-                NULL_SENTINEL
-            } else {
-                let q = (value * QUANT_SCALE).round();
-                q.clamp(0.0, f32::from(i16::MAX)) as i16
-            };
+            soa[d * n_padded + i] = if value < 0.0 { NULL_SENTINEL } else { value };
         }
     }
     drop(refs);
@@ -85,21 +91,27 @@ fn main() -> Result<()> {
     header[4..8].copy_from_slice(&VERSION.to_le_bytes());
     header[8..12].copy_from_slice(&(DIM as u32).to_le_bytes());
     header[12..16].copy_from_slice(&(n as u32).to_le_bytes());
-    header[16..20].copy_from_slice(&QUANT_SCALE.to_le_bytes());
     w.write_all(&header)?;
-
     w.write_all(&labels)?;
+
+    // Padding entre LABELS e VECTORS pra alinhar SoA em ALIGN bytes.
+    let labels_end = HEADER_SIZE + n;
+    let vectors_off = align_up(labels_end, ALIGN);
+    let pad = vectors_off - labels_end;
+    if pad > 0 {
+        w.write_all(&vec![0_u8; pad])?;
+    }
 
     let bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(
             soa.as_ptr().cast::<u8>(),
-            soa.len() * std::mem::size_of::<i16>(),
+            soa.len() * std::mem::size_of::<f32>(),
         )
     };
     w.write_all(bytes)?;
     w.flush()?;
 
-    let total = HEADER_SIZE + n + soa.len() * 2;
+    let total = vectors_off + soa.len() * 4;
     eprintln!(
         "ok ({} bytes / {:.2} MB)",
         total,

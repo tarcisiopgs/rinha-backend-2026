@@ -1,22 +1,23 @@
-//! Dataset de referência quantizado i16 SoA + label binário.
+//! Dataset de referência em SoA f32 + label binário.
 //!
-//! Formato binário (little-endian):
+//! Formato binário (little-endian, alinhado a 64 bytes pra AVX2):
 //! ```text
 //! HEADER (32 bytes)
-//!   magic        u32  = 0x52424B32 ("RBK2")
-//!   version      u32  = 2
+//!   magic        u32  = 0x52424B33 ("RBK3")
+//!   version      u32  = 3
 //!   dim          u32  = 14
 //!   n            u32  = 3_000_000
-//!   scale        f32  = 8192.0
-//!   _reserved    [u8; 12]
+//!   _reserved    [u8; 16]
 //!
-//! LABELS  (n bytes)         // u8: 0 = legit, 1 = fraud
-//! VECTORS (DIM * n * 2 b)   // i16 SoA: dim 0 todos n, dim 1 todos n, ...
-//!                           // Sentinela `i16::MIN` = ausência de dado (-1 do payload).
+//! LABELS  (n bytes)             // u8: 0 = legit, 1 = fraud
+//! PAD     (até múltiplo de 64)
+//! VECTORS (DIM * n_padded * 4)  // f32 SoA: dim 0 todos n_padded, dim 1 todos n_padded, ...
+//!                               // Sentinela `-1.0` mantida do payload (last_transaction null).
 //! ```
 //!
-//! SoA + alinhamento natural acelera SIMD AVX2 e reduz cache miss em batch
-//! por dimensão. mmap deixa o kernel paginar sob demanda.
+//! `n_padded = ceil(n / 8) * 8` permite carregar 8 lanes f32 (256-bit AVX2)
+//! sem checagem de bounds no hot path. Posições extras recebem distância
+//! infinita via valores fora do espaço normalizado (TopK descarta).
 
 use std::path::Path;
 
@@ -24,11 +25,13 @@ use memmap2::Mmap;
 
 use crate::proto::DIM;
 
-pub const MAGIC: u32 = 0x5242_4B32;
-pub const VERSION: u32 = 2;
+pub const MAGIC: u32 = 0x5242_4B33;
+pub const VERSION: u32 = 3;
 pub const HEADER_SIZE: usize = 32;
 pub const LABEL_LEGIT: u8 = 0;
 pub const LABEL_FRAUD: u8 = 1;
+pub const ALIGN: usize = 64;
+pub const SIMD_LANES: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DatasetError {
@@ -52,12 +55,12 @@ pub enum DatasetError {
 pub struct Dataset {
     _mmap: Mmap,
     n: usize,
-    scale: f32,
+    n_padded: usize,
     labels: *const u8,
-    vectors: *const i16,
+    vectors: *const f32,
 }
 
-// SAFETY: mmap imutável compartilhada; ponteiros vivem enquanto _mmap vive.
+// SAFETY: mmap imutável; ponteiros vivem enquanto _mmap vive. Sem mutação.
 unsafe impl Send for Dataset {}
 unsafe impl Sync for Dataset {}
 
@@ -90,11 +93,11 @@ impl Dataset {
         }
 
         let n = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
-        let scale = f32::from_le_bytes(mmap[16..20].try_into().unwrap());
+        let n_padded = padded_n(n);
 
         let labels_off = HEADER_SIZE;
-        let vectors_off = labels_off + n;
-        let expected = vectors_off + DIM * n * std::mem::size_of::<i16>();
+        let vectors_off = align_up(labels_off + n, ALIGN);
+        let expected = vectors_off + DIM * n_padded * std::mem::size_of::<f32>();
 
         if mmap.len() < expected {
             return Err(DatasetError::Truncated {
@@ -104,12 +107,12 @@ impl Dataset {
         }
 
         let labels = unsafe { mmap.as_ptr().add(labels_off) };
-        let vectors = unsafe { mmap.as_ptr().add(vectors_off).cast::<i16>() };
+        let vectors = unsafe { mmap.as_ptr().add(vectors_off).cast::<f32>() };
 
         Ok(Self {
             _mmap: mmap,
             n,
-            scale,
+            n_padded,
             labels,
             vectors,
         })
@@ -121,39 +124,56 @@ impl Dataset {
         self.n
     }
 
+    /// `n` arredondado pra múltiplo de SIMD_LANES. Hot path SIMD lê
+    /// `n_padded` lanes, posições além de `n` contêm valores que produzem
+    /// distância grande o suficiente pra serem descartadas pelo TopK.
+    #[inline]
+    #[must_use]
+    pub fn n_padded(&self) -> usize {
+        self.n_padded
+    }
+
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.n == 0
     }
 
-    #[inline]
-    #[must_use]
-    pub fn scale(&self) -> f32 {
-        self.scale
-    }
-
-    /// `true` se vetor `i` é fraude.
+    /// `true` se vetor `i` é fraude. Posições além de `n` retornam `false`.
     #[inline]
     #[must_use]
     pub fn is_fraud(&self, i: usize) -> bool {
-        debug_assert!(i < self.n);
-        // SAFETY: i validado por debug_assert.
+        if i >= self.n {
+            return false;
+        }
+        // SAFETY: i < n.
         unsafe { *self.labels.add(i) == LABEL_FRAUD }
     }
 
-    /// Slice contíguo da dimensão `d`. Tamanho = `n`.
+    /// Slice contíguo da dimensão `d`, tamanho = `n_padded`.
     #[inline]
     #[must_use]
-    pub fn dim_column(&self, d: usize) -> &[i16] {
+    pub fn dim_column(&self, d: usize) -> &[f32] {
         debug_assert!(d < DIM);
-        // SAFETY: matriz SoA tem DIM colunas de tamanho n.
-        unsafe { std::slice::from_raw_parts(self.vectors.add(d * self.n), self.n) }
+        // SAFETY: matriz SoA tem DIM colunas de tamanho n_padded.
+        unsafe { std::slice::from_raw_parts(self.vectors.add(d * self.n_padded), self.n_padded) }
     }
 
     #[inline]
     #[must_use]
-    pub fn vectors_ptr(&self) -> *const i16 {
+    pub fn vectors_ptr(&self) -> *const f32 {
         self.vectors
     }
+}
+
+#[inline]
+#[must_use]
+pub const fn padded_n(n: usize) -> usize {
+    n.div_ceil(SIMD_LANES) * SIMD_LANES
+}
+
+#[inline]
+#[must_use]
+pub const fn align_up(v: usize, a: usize) -> usize {
+    v.div_ceil(a) * a
 }

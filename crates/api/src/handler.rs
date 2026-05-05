@@ -10,7 +10,7 @@ use std::rc::Rc;
 use anyhow::{Context, Result};
 use bytes::BytesMut;
 use common::normalize::NormalizationConfig;
-use common::{simd, Dataset, McCRiskTable};
+use common::{Dataset, McCRiskTable};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{TcpStream, UnixStream};
 
@@ -88,8 +88,7 @@ fn handle_fraud_score(body: &[u8], dataset: &Dataset) -> bytes::Bytes {
         Ok(view) => MCC.with(|mcc| {
             CFG.with(|cfg| {
                 let raw = common::normalize::normalize(&view, cfg, mcc);
-                let q = simd::quantize(&raw);
-                knn::count_fraud_neighbors(&q, dataset)
+                knn::count_fraud_neighbors(&raw, dataset)
             })
         }),
         Err(_) => return RESPONSES.with(ResponseTable::fallback_approved),

@@ -13,6 +13,8 @@ mod handler;
 mod http;
 mod json;
 mod knn;
+#[cfg(target_arch = "x86_64")]
+mod knn_avx2;
 
 #[derive(Debug, Clone)]
 enum Listen {

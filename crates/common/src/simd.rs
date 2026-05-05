@@ -1,42 +1,19 @@
-//! Quantização e operações SIMD pro hot path.
-//!
-//! Hot path real (k-NN brute-force) está em `api::knn` — aqui ficam apenas
-//! helpers reutilizáveis (quantização e baseline escalar pra testes/profile).
+//! Operações vetoriais escalares (referência). AVX2 fica em `api::knn_avx2`.
 
-use crate::proto::{DIM, NULL_SENTINEL, QUANT_SCALE};
+use crate::proto::DIM;
 
-/// Quantiza vetor f32 → i16 com escala `QUANT_SCALE`. Sentinelas `-1.0`
-/// (ausência de dado nas posições 5/6) viram `NULL_SENTINEL` (`i16::MIN`).
+/// Distância L2² escalar entre dois vetores f32.
+///
+/// Sentinela `-1.0` é tratada como valor regular — `(query[d] - v[d])²`
+/// produz separação grande quando apenas um lado é null, e zero quando
+/// ambos são null, exatamente o comportamento descrito na spec.
 #[inline]
 #[must_use]
-pub fn quantize(input: &[f32; DIM]) -> [i16; DIM] {
-    let mut out = [0_i16; DIM];
-    for i in 0..DIM {
-        out[i] = quantize_one(input[i]);
-    }
-    out
-}
-
-#[inline]
-#[must_use]
-pub fn quantize_one(x: f32) -> i16 {
-    if x < 0.0 {
-        NULL_SENTINEL
-    } else {
-        let q = (x * QUANT_SCALE).round();
-        q.clamp(0.0, f32::from(i16::MAX)) as i16
-    }
-}
-
-/// L2² escalar entre dois vetores quantizados. Não otimizado — referência
-/// pra teste e fallback.
-#[inline]
-#[must_use]
-pub fn l2_squared_scalar(a: &[i16; DIM], b: &[i16; DIM]) -> i64 {
-    let mut acc: i64 = 0;
+pub fn l2_squared(query: &[f32; DIM], v: &[f32; DIM]) -> f32 {
+    let mut acc = 0.0_f32;
     for d in 0..DIM {
-        let diff = i32::from(a[d]) - i32::from(b[d]);
-        acc += i64::from(diff) * i64::from(diff);
+        let diff = query[d] - v[d];
+        acc += diff * diff;
     }
     acc
 }
@@ -46,21 +23,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quantize_normal_value() {
-        assert_eq!(quantize_one(0.5), 4096);
-        assert_eq!(quantize_one(1.0), 8192);
-        assert_eq!(quantize_one(0.0), 0);
-    }
-
-    #[test]
-    fn quantize_negative_becomes_sentinel() {
-        assert_eq!(quantize_one(-1.0), NULL_SENTINEL);
-        assert_eq!(quantize_one(-0.5), NULL_SENTINEL);
-    }
-
-    #[test]
     fn l2_zero_for_identical() {
-        let v = [1_i16; DIM];
-        assert_eq!(l2_squared_scalar(&v, &v), 0);
+        let v = [0.5_f32; DIM];
+        assert!(l2_squared(&v, &v).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_known_distance() {
+        let mut a = [0.0_f32; DIM];
+        let mut b = [0.0_f32; DIM];
+        a[0] = 0.5;
+        b[0] = 0.2;
+        // (0.5 - 0.2)^2 = 0.09
+        assert!((l2_squared(&a, &b) - 0.09).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_null_pair_zero() {
+        let null_vec = [-1.0_f32; DIM];
+        assert!(l2_squared(&null_vec, &null_vec).abs() < 1e-6);
     }
 }

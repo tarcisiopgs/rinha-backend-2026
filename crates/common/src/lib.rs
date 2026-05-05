@@ -10,4 +10,4 @@ pub mod time;
 pub use dataset::{Dataset, DatasetError};
 pub use mcc::McCRiskTable;
 pub use normalize::{normalize, NormalizationConfig};
-pub use proto::{APPROVED_THRESHOLD, DIM, K, NULL_SENTINEL, QUANT_SCALE, SCORE_BUCKETS};
+pub use proto::{APPROVED_THRESHOLD, DIM, K, NULL_SENTINEL, SCORE_BUCKETS};
