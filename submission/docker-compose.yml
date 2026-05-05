@@ -16,6 +16,7 @@ services:
       API_LISTEN: tcp:0.0.0.0:9000
       DATASET_PATH: /data/references.bin
       RUST_LOG: warn
+      MONOIO_DRIVER: legacy
     deploy:
       resources:
         limits:
@@ -31,6 +32,7 @@ services:
       API_LISTEN: tcp:0.0.0.0:9000
       DATASET_PATH: /data/references.bin
       RUST_LOG: warn
+      MONOIO_DRIVER: legacy
     deploy:
       resources:
         limits:
@@ -46,6 +48,7 @@ services:
       LB_LISTEN: 0.0.0.0:9999
       LB_UPSTREAMS: tcp:api1:9000,tcp:api2:9000
       RUST_LOG: warn
+      MONOIO_DRIVER: legacy
     ports:
       - "9999:9999"
     depends_on:
