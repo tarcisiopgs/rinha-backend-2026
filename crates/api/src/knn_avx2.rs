@@ -8,7 +8,7 @@
 #![cfg(target_arch = "x86_64")]
 
 use std::arch::x86_64::{
-    _mm256_add_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_setzero_ps,
+    __m256, _mm256_add_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_setzero_ps,
     _mm256_storeu_ps, _mm256_sub_ps,
 };
 
@@ -32,13 +32,16 @@ pub unsafe fn count_fraud_neighbors_avx2(query: &[f32; DIM], dataset: &Dataset) 
 
     let columns: [*const f32; DIM] = std::array::from_fn(|d| dataset.dim_column(d).as_ptr());
 
-    let q: [std::arch::x86_64::__m256; DIM] = std::array::from_fn(|d| _mm256_set1_ps(query[d]));
+    // SAFETY: target_feature avx2 garantida pelo chamador.
+    let q: [__m256; DIM] = std::array::from_fn(|d| unsafe { _mm256_set1_ps(query[d]) });
 
     let mut chunk = 0;
     while chunk < n_padded {
-        let dists = chunk_dists(&q, &columns, chunk);
+        // SAFETY: chunk + LANES ≤ n_padded por construção do dataset.
+        let dists = unsafe { chunk_dists(&q, &columns, chunk) };
         let mut buf = [0.0_f32; LANES];
-        _mm256_storeu_ps(buf.as_mut_ptr(), dists);
+        // SAFETY: buf tem LANES f32 contíguos.
+        unsafe { _mm256_storeu_ps(buf.as_mut_ptr(), dists) };
         for lane in 0..LANES {
             let idx = chunk + lane;
             if idx >= n {
@@ -61,42 +64,44 @@ pub unsafe fn count_fraud_neighbors_avx2(query: &[f32; DIM], dataset: &Dataset) 
 
 /// Calcula L2² entre `query` e os 8 vetores do dataset começando em `chunk`.
 /// Usa 4 acumuladores independentes pra paralelismo no pipeline FMA.
+///
+/// # Safety
+/// `chunk + LANES ≤ n_padded` em cada `dim_column`.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
-unsafe fn chunk_dists(
-    q: &[std::arch::x86_64::__m256; DIM],
-    columns: &[*const f32; DIM],
-    chunk: usize,
-) -> std::arch::x86_64::__m256 {
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
-    let mut acc2 = _mm256_setzero_ps();
-    let mut acc3 = _mm256_setzero_ps();
+unsafe fn chunk_dists(q: &[__m256; DIM], columns: &[*const f32; DIM], chunk: usize) -> __m256 {
+    // SAFETY: target_feature avx2,fma; ponteiros alinhados a 8 lanes f32 dentro de n_padded.
+    unsafe {
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
 
-    macro_rules! step {
-        ($acc:ident, $d:expr) => {{
-            let v = _mm256_loadu_ps(columns[$d].add(chunk));
-            let diff = _mm256_sub_ps(q[$d], v);
-            $acc = _mm256_fmadd_ps(diff, diff, $acc);
-        }};
+        macro_rules! step {
+            ($acc:ident, $d:expr) => {{
+                let v = _mm256_loadu_ps(columns[$d].add(chunk));
+                let diff = _mm256_sub_ps(q[$d], v);
+                $acc = _mm256_fmadd_ps(diff, diff, $acc);
+            }};
+        }
+
+        step!(acc0, 0);
+        step!(acc1, 1);
+        step!(acc2, 2);
+        step!(acc3, 3);
+        step!(acc0, 4);
+        step!(acc1, 5);
+        step!(acc2, 6);
+        step!(acc3, 7);
+        step!(acc0, 8);
+        step!(acc1, 9);
+        step!(acc2, 10);
+        step!(acc3, 11);
+        step!(acc0, 12);
+        step!(acc1, 13);
+
+        let s01 = _mm256_add_ps(acc0, acc1);
+        let s23 = _mm256_add_ps(acc2, acc3);
+        _mm256_add_ps(s01, s23)
     }
-
-    step!(acc0, 0);
-    step!(acc1, 1);
-    step!(acc2, 2);
-    step!(acc3, 3);
-    step!(acc0, 4);
-    step!(acc1, 5);
-    step!(acc2, 6);
-    step!(acc3, 7);
-    step!(acc0, 8);
-    step!(acc1, 9);
-    step!(acc2, 10);
-    step!(acc3, 11);
-    step!(acc0, 12);
-    step!(acc1, 13);
-
-    let s01 = _mm256_add_ps(acc0, acc1);
-    let s23 = _mm256_add_ps(acc2, acc3);
-    _mm256_add_ps(s01, s23)
 }
