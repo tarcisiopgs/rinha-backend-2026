@@ -18,6 +18,10 @@ repository = "https://github.com/tarcisiopgs/rinha-backend-2026"
 common = { path = "crates/common" }
 
 monoio = { version = "0.2", features = ["sync", "iouring", "legacy", "bytes"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http-body-util = "0.1"
 bytes = "1.8"
 memchr = "2.7"
 itoa = "1.0"

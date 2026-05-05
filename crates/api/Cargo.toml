@@ -12,7 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 common.workspace = true
-monoio.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
 bytes.workspace = true
 memchr.workspace = true
 itoa.workspace = true
