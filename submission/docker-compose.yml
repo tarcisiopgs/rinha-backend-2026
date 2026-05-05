@@ -5,18 +5,23 @@ name: rinha-2026
 # dataset embutido em /data/references.bin).
 #
 # Total: 1 CPU, 350 MB. 2 APIs com 0.40 CPU / 160 MB cada + LB com 0.20 CPU
-# / 30 MB. LB precisa de mais headroom porque sob 250 VUs concorrentes do k6
-# o pump aloca 250×2 buffers de 8KB + monoio runtime stack — 10 MB era OOM.
+# / 30 MB. ulimits nofile=65535 evita exhaustion de fds quando o k6 abre 250
+# VUs concorrentes durante o ramp.
 
 services:
   api1:
     image: ghcr.io/tarcisiopgs/rinha-backend-2026:latest
+    platform: linux/amd64
     entrypoint: ["/usr/local/bin/api"]
     environment:
       API_LISTEN: tcp:0.0.0.0:9000
       DATASET_PATH: /data/references.bin
       RUST_LOG: warn
       MONOIO_DRIVER: legacy
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
@@ -27,12 +32,17 @@ services:
 
   api2:
     image: ghcr.io/tarcisiopgs/rinha-backend-2026:latest
+    platform: linux/amd64
     entrypoint: ["/usr/local/bin/api"]
     environment:
       API_LISTEN: tcp:0.0.0.0:9000
       DATASET_PATH: /data/references.bin
       RUST_LOG: warn
       MONOIO_DRIVER: legacy
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
@@ -43,12 +53,17 @@ services:
 
   lb:
     image: ghcr.io/tarcisiopgs/rinha-backend-2026:latest
+    platform: linux/amd64
     entrypoint: ["/usr/local/bin/lb"]
     environment:
       LB_LISTEN: 0.0.0.0:9999
       LB_UPSTREAMS: tcp:api1:9000,tcp:api2:9000
       RUST_LOG: warn
       MONOIO_DRIVER: legacy
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     ports:
       - "9999:9999"
     depends_on:
