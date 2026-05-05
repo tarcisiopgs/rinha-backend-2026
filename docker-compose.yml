@@ -1,11 +1,11 @@
 name: rinha-2026
 
-# Compose oficial. Setup convergindo no que lothyriel/rinha_2026 fez pra
-# passar no Mac Mini Late 2014, exceto que voltamos pra TCP intra-bridge:
-# UDS sobre tmpfs falha no bench runner (api exit 1 no bind, mesmo bug que
-# vimos com monoio antes — kernel/seccomp do Docker no Mac Mini bloqueia).
-#
-# Total: 1 CPU, 350 MB. CPU split 0.3 API + 0.3 API + 0.4 LB.
+# Compose oficial. Replicando o setup do lothyriel/rinha_2026 (Rust+axum,
+# passa no Mac Mini Late 2014):
+#   - tokio current_thread (single-thread runtime, sem overhead multi_thread)
+#   - UDS via tmpfs volume mode=0777 + APIs setam 0o666 no socket
+#   - HAProxy com http-reuse always proxying via unix@
+#   - CPU split 0.3 + 0.3 + 0.4 (LB precisa de mais CPU)
 
 services:
   api1:
@@ -15,9 +15,11 @@ services:
       - seccomp=unconfined
     entrypoint: ["/usr/local/bin/api"]
     environment:
-      API_LISTEN: tcp:0.0.0.0:9000
+      API_LISTEN: unix:/sockets/api1.sock
       DATASET_PATH: /data/references.bin
       RUST_LOG: warn
+    volumes:
+      - sockets:/sockets
     ulimits:
       nofile:
         soft: 65535
@@ -37,9 +39,11 @@ services:
       - seccomp=unconfined
     entrypoint: ["/usr/local/bin/api"]
     environment:
-      API_LISTEN: tcp:0.0.0.0:9000
+      API_LISTEN: unix:/sockets/api2.sock
       DATASET_PATH: /data/references.bin
       RUST_LOG: warn
+    volumes:
+      - sockets:/sockets
     ulimits:
       nofile:
         soft: 65535
@@ -57,6 +61,7 @@ services:
     platform: linux/amd64
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sockets:/sockets
     ulimits:
       nofile:
         soft: 65535
@@ -73,6 +78,13 @@ services:
           memory: "50MB"
     networks:
       - rinha
+
+volumes:
+  sockets:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=4m,mode=0777"
 
 networks:
   rinha:
