@@ -4,8 +4,8 @@
 //! 4 acumuladores independentes (4-way unrolling) pra mascarar latência da
 //! cadeia FMA. 14 dimensões × 8 lanes = scan completo de 8 vetores em ~17
 //! ciclos efetivos no Haswell.
-
-#![cfg(target_arch = "x86_64")]
+//!
+//! O módulo é cfg-gated em `target_arch = "x86_64"` no `main.rs`.
 
 use std::arch::x86_64::{
     __m256, _mm256_add_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_setzero_ps,
@@ -42,12 +42,12 @@ pub unsafe fn count_fraud_neighbors_avx2(query: &[f32; DIM], dataset: &Dataset) 
         let mut buf = [0.0_f32; LANES];
         // SAFETY: buf tem LANES f32 contíguos.
         unsafe { _mm256_storeu_ps(buf.as_mut_ptr(), dists) };
-        for lane in 0..LANES {
+        for (lane, &dist) in buf.iter().enumerate() {
             let idx = chunk + lane;
             if idx >= n {
                 break;
             }
-            top.try_push(buf[lane], idx as u32);
+            top.try_push(dist, idx as u32);
         }
         chunk += LANES;
     }
