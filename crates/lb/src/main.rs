@@ -9,8 +9,52 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
+use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
 use monoio::net::{TcpListener, TcpStream, UnixStream};
+
+/// Buffer com semântica de append. monoio's `IoBufMut for Vec<u8>` /
+/// `BytesMut` escrevem a partir do offset 0 ignorando `len()`, sobrescrevendo
+/// dados não consumidos quando o read retorna parcial.
+struct ReadBuf(Vec<u8>);
+
+impl ReadBuf {
+    fn with_capacity(cap: usize) -> Self {
+        Self(Vec::with_capacity(cap))
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+unsafe impl IoBufMut for ReadBuf {
+    fn write_ptr(&mut self) -> *mut u8 {
+        // SAFETY: len ≤ capacity.
+        unsafe { self.0.as_mut_ptr().add(self.0.len()) }
+    }
+
+    fn bytes_total(&mut self) -> usize {
+        self.0.capacity() - self.0.len()
+    }
+
+    unsafe fn set_init(&mut self, init_len: usize) {
+        let new_len = self.0.len() + init_len;
+        // SAFETY: init_len bytes acabam de ser escritos pelo kernel a partir
+        // de `len()`.
+        unsafe { self.0.set_len(new_len) };
+    }
+}
+
+unsafe impl IoBuf for ReadBuf {
+    fn read_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.0.len()
+    }
+}
 
 #[derive(Debug, Clone)]
 enum Upstream {
@@ -154,22 +198,22 @@ where
     R: AsyncReadRent,
     W: AsyncWriteRentExt,
 {
-    // Vec<u8> + clear por iteração mantém a capacity intacta. O padrão antigo
-    // com `BytesMut::split().freeze()` movia a alocação inteira pro chunk de
-    // saída e deixava `buf` com capacity 0 — o `read` seguinte retornava 0
-    // (sem espaço) e o LB interpretava como EOF, fechando conexões keep-alive
-    // de cliente ↔ LB ↔ upstream prematuramente.
+    // Custom IoBufMut com semântica de append (write_ptr aponta pra `len()`).
+    // monoio's IoBufMut padrão pra Vec<u8>/BytesMut sobrescreve a partir do
+    // offset 0, descartando bytes não consumidos — por sorte aqui o copy
+    // sempre faz drain completo via write_all antes de outro read, mas
+    // mantemos o append-buf por consistência e robustez.
     const BUF: usize = 8192;
-    let mut buf: Vec<u8> = Vec::with_capacity(BUF);
+    let mut buf = ReadBuf::with_capacity(BUF);
     loop {
-        let take = std::mem::take(&mut buf);
+        let take = std::mem::replace(&mut buf, ReadBuf::with_capacity(0));
         let (res, returned) = r.read(take).await;
         buf = returned;
         let n = res?;
         if n == 0 {
             return Ok(());
         }
-        let to_write = std::mem::take(&mut buf);
+        let to_write = std::mem::replace(&mut buf, ReadBuf::with_capacity(BUF));
         let (res, returned) = w.write_all(to_write).await;
         res?;
         buf = returned;
