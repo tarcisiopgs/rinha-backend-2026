@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-use memmap2::{Mmap, MmapOptions};
+use memmap2::Mmap;
 
 use crate::proto::{DIM, NLIST};
 
@@ -77,11 +77,8 @@ unsafe impl Sync for Dataset {}
 impl Dataset {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DatasetError> {
         let file = std::fs::File::open(path)?;
-        // MAP_POPULATE prefault todas as pages no startup — evita que a primeira
-        // request sob carga pague page faults sequenciais (84 MB ÷ 4 KB ≈ 21k
-        // páginas). No bench Mac Mini Late 2014 isso corta latência inicial.
         // SAFETY: arquivo não será modificado durante o tempo de vida do Dataset.
-        let mmap = unsafe { MmapOptions::new().populate().map(&file)? };
+        let mmap = unsafe { Mmap::map(&file)? };
 
         if mmap.len() < HEADER_SIZE {
             return Err(DatasetError::Truncated {

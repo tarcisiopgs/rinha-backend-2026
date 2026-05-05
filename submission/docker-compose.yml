@@ -1,14 +1,11 @@
 name: rinha-2026
 
-# Compose oficial. Setup convergindo no que lothyriel/rinha_2026 (Rust+axum)
-# fez pra passar no Mac Mini Late 2014:
-#   - UDS via tmpfs volume (mode=0777) entre LB ↔ APIs (sem TCP overhead)
-#   - healthcheck nos APIs com start_period=20s pra prefault mmap completo
-#     antes do bot iniciar o bench
-#   - CPU split 0.3 + 0.3 + 0.4 (LB precisa de mais CPU pra drain accept queue)
+# Compose oficial. Setup convergindo no que lothyriel/rinha_2026 fez pra
+# passar no Mac Mini Late 2014, exceto que voltamos pra TCP intra-bridge:
+# UDS sobre tmpfs falha no bench runner (api exit 1 no bind, mesmo bug que
+# vimos com monoio antes — kernel/seccomp do Docker no Mac Mini bloqueia).
 #
-# Total: 1 CPU, 350 MB. tokio UDS bind funciona em todos os runners (monoio
-# tinha ENOTSUP no Mac Mini, por isso voltamos UDS agora que estamos em tokio).
+# Total: 1 CPU, 350 MB. CPU split 0.3 API + 0.3 API + 0.4 LB.
 
 services:
   api1:
@@ -18,22 +15,13 @@ services:
       - seccomp=unconfined
     entrypoint: ["/usr/local/bin/api"]
     environment:
-      API_LISTEN: unix:/sockets/api1.sock
+      API_LISTEN: tcp:0.0.0.0:9000
       DATASET_PATH: /data/references.bin
       RUST_LOG: warn
-    volumes:
-      - sockets:/sockets
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
-    healthcheck:
-      test:
-        ["CMD-SHELL", "test -S /sockets/api1.sock"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 20s
     deploy:
       resources:
         limits:
@@ -49,22 +37,13 @@ services:
       - seccomp=unconfined
     entrypoint: ["/usr/local/bin/api"]
     environment:
-      API_LISTEN: unix:/sockets/api2.sock
+      API_LISTEN: tcp:0.0.0.0:9000
       DATASET_PATH: /data/references.bin
       RUST_LOG: warn
-    volumes:
-      - sockets:/sockets
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
-    healthcheck:
-      test:
-        ["CMD-SHELL", "test -S /sockets/api2.sock"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 20s
     deploy:
       resources:
         limits:
@@ -78,7 +57,6 @@ services:
     platform: linux/amd64
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - sockets:/sockets
     ulimits:
       nofile:
         soft: 65535
@@ -86,10 +64,8 @@ services:
     ports:
       - "9999:9999"
     depends_on:
-      api1:
-        condition: service_healthy
-      api2:
-        condition: service_healthy
+      - api1
+      - api2
     deploy:
       resources:
         limits:
@@ -97,13 +73,6 @@ services:
           memory: "50MB"
     networks:
       - rinha
-
-volumes:
-  sockets:
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
-      o: "size=4m,mode=0777"
 
 networks:
   rinha:
