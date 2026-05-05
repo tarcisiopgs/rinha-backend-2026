@@ -46,4 +46,83 @@ jobs:
       - name: build
         env:
           RUSTFLAGS: "-C target-cpu=haswell -C target-feature=+avx2,+fma"
-        run: cargo build --release --bin api --bin lb --locked
+        run: cargo build --release --bin api --bin lb --bin preprocess --locked
+
+  bench:
+    name: latency bench (real x86_64 + AVX2)
+    runs-on: ubuntu-24.04
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.82
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cpu info
+        run: |
+          echo "## CPU"
+          lscpu | grep -E "Model name|CPU\(s\)|MHz"
+          echo "## avx2 + fma"
+          grep -oE 'avx2|fma' /proc/cpuinfo | sort -u
+
+      - name: download dataset
+        run: |
+          mkdir -p data
+          curl -sL --fail \
+            -o data/references.json.gz \
+            https://github.com/zanfranceschi/rinha-de-backend-2026/raw/main/resources/references.json.gz
+          ls -lh data/references.json.gz
+
+      - name: build release
+        env:
+          RUSTFLAGS: "-C target-cpu=haswell -C target-feature=+avx2,+fma"
+        run: cargo build --release --bin api --bin preprocess --locked
+
+      - name: preprocess dataset
+        run: ./target/release/preprocess data/references.json.gz data/references.bin
+
+      - name: start api
+        env:
+          API_LISTEN: tcp:127.0.0.1:9000
+          DATASET_PATH: data/references.bin
+          MONOIO_DRIVER: legacy
+          RUST_LOG: warn
+        run: |
+          ./target/release/api > /tmp/api.log 2>&1 &
+          echo $! > /tmp/api.pid
+          # aguarda /ready (timeout 30s)
+          for _ in $(seq 1 30); do
+            if curl -fs --max-time 2 http://127.0.0.1:9000/ready > /dev/null; then
+              echo "api up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "api boot timeout"; cat /tmp/api.log; exit 1
+
+      - name: bench /fraud-score (1k requests)
+        run: |
+          cat > /tmp/payload.json <<'EOF'
+          {"id":"tx-3330991687","transaction":{"amount":9505.97,"installments":10,"requested_at":"2026-03-14T05:15:12Z"},"customer":{"avg_amount":81.28,"tx_count_24h":20,"known_merchants":["MERC-008","MERC-007","MERC-005"]},"merchant":{"id":"MERC-068","mcc":"7802","avg_amount":54.86},"terminal":{"is_online":false,"card_present":true,"km_from_home":952.27},"last_transaction":null}
+          EOF
+          # warm-up: page-in dataset
+          for _ in $(seq 1 50); do
+            curl -s --max-time 30 -X POST http://127.0.0.1:9000/fraud-score \
+              -H 'Content-Type: application/json' --data @/tmp/payload.json > /dev/null
+          done
+          # bench
+          for _ in $(seq 1 1000); do
+            curl -s -o /dev/null -w "%{time_total}\n" -X POST http://127.0.0.1:9000/fraud-score \
+              -H 'Content-Type: application/json' --data @/tmp/payload.json
+          done | sort -n | awk '
+            BEGIN{c=0}
+            {a[c++]=$1*1000}
+            END{
+              printf "n=%d min=%.3fms p50=%.3fms p90=%.3fms p99=%.3fms p999=%.3fms max=%.3fms\n",
+                c, a[0], a[int(c*0.5)], a[int(c*0.9)], a[int(c*0.99)], a[int(c*0.999)], a[c-1]
+            }'
+
+      - name: stop api
+        if: always()
+        run: kill "$(cat /tmp/api.pid)" || true
