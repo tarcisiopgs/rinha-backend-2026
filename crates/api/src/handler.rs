@@ -8,7 +8,6 @@
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
-use bytes::BytesMut;
 use common::normalize::NormalizationConfig;
 use common::{Dataset, McCRiskTable};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -37,10 +36,19 @@ async fn serve_loop<S>(mut stream: S, dataset: Rc<Dataset>) -> Result<()>
 where
     S: AsyncReadRent + AsyncWriteRentExt,
 {
-    let mut buf = BytesMut::with_capacity(READ_BUF_INITIAL);
+    // Reuso o mesmo `Vec<u8>` pra todos os reads desta conexão. `drain(..consumed)`
+    // remove os bytes já processados sem mexer na capacity da alocação. O bug
+    // anterior usava `BytesMut::split_to`, que faz advance no start ptr e reduz
+    // a capacity disponível a cada request — em keep-alive longo, capacity
+    // chegava a zero, `read` retornava 0 e o handler interpretava como EOF.
+    let mut buf: Vec<u8> = Vec::with_capacity(READ_BUF_INITIAL);
 
     loop {
-        let take = std::mem::replace(&mut buf, BytesMut::new());
+        if buf.capacity() - buf.len() < 1024 {
+            buf.reserve(1024);
+        }
+
+        let take = std::mem::take(&mut buf);
         let (res, returned) = stream.read(take).await;
         buf = returned;
         let n = res.context("read")?;
@@ -57,7 +65,7 @@ where
                     };
                     let (res, _) = stream.write_all(response).await;
                     res.context("write")?;
-                    let _ = buf.split_to(consumed);
+                    buf.drain(..consumed);
                     if buf.is_empty() {
                         break;
                     }
