@@ -1,33 +1,36 @@
-//! Dataset de referência em SoA i16 (f32 quantizado por `QUANT_SCALE`) + label binário.
+//! Dataset de referência IVF (inverted file) sobre i16 quantizado + label binário.
 //!
 //! Formato binário (little-endian, alinhado a 64 bytes pra AVX2):
 //! ```text
 //! HEADER (32 bytes)
 //!   magic        u32  = 0x52424B33 ("RBK3")
-//!   version      u32  = 4
+//!   version      u32  = 5
 //!   dim          u32  = 14
 //!   n            u32  = 3_000_000
-//!   _reserved    [u8; 16]
+//!   nlist        u32  = 1024
+//!   _reserved    [u8; 12]
 //!
-//! LABELS  (n bytes)             // u8: 0 = legit, 1 = fraud
-//! PAD     (até múltiplo de 64)
-//! VECTORS (DIM * n_padded * 2)  // i16 SoA: dim 0 todos n_padded, dim 1 todos n_padded, ...
-//!                               // Sentinela `NULL_SENTINEL_I16` (-4096) mantida do payload.
+//! LABELS_SORTED  (n bytes)                       // u8: ordem reordenada por cluster.
+//! PAD            (até múltiplo de 64)
+//! CENTROIDS_SOA  (DIM * NLIST * 2 bytes)         // i16, dim 0 todos os centroides, dim 1, ...
+//! PAD            (até múltiplo de 64)
+//! BOUNDARIES     ((nlist + 1) * 4 bytes)         // u32: índice inicial do cluster c.
+//! PAD            (até múltiplo de 64)
+//! VECTORS_SOA    (DIM * n_padded * 2 bytes)      // i16, vetores reordenados por cluster.
 //! ```
 //!
-//! `n_padded = ceil(n / 8) * 8` permite carregar 8 lanes i16 (128-bit) e
-//! expandir pra 8 lanes i32 (256-bit AVX2) sem checagem de bounds no hot path.
-//! Posições extras recebem `0` — distância arbitrária mas dentro do range i32;
-//! TopK ignora os índices ≥ n via filtro pós-cálculo.
+//! `n_padded = ceil(n / 8) * 8` permite lidar com SIMD de 8 lanes mesmo
+//! escaneando ranges arbitrários — a última fração pode "vazar" pro próximo
+//! cluster, mas o filtro `idx >= cluster_end` no caller descarta as lanes.
 
 use std::path::Path;
 
 use memmap2::Mmap;
 
-use crate::proto::DIM;
+use crate::proto::{DIM, NLIST};
 
 pub const MAGIC: u32 = 0x5242_4B33;
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 pub const HEADER_SIZE: usize = 32;
 pub const LABEL_LEGIT: u8 = 0;
 pub const LABEL_FRAUD: u8 = 1;
@@ -48,6 +51,9 @@ pub enum DatasetError {
     #[error("dim inesperado: esperado {DIM}, encontrado {0}")]
     BadDim(u32),
 
+    #[error("nlist inesperado: esperado {NLIST}, encontrado {0}")]
+    BadNlist(u32),
+
     #[error("arquivo truncado: esperado {expected} bytes, tem {actual}")]
     Truncated { expected: usize, actual: usize },
 }
@@ -57,7 +63,10 @@ pub struct Dataset {
     _mmap: Mmap,
     n: usize,
     n_padded: usize,
+    nlist: usize,
     labels: *const u8,
+    centroids: *const i16,
+    boundaries: *const u32,
     vectors: *const i16,
 }
 
@@ -96,8 +105,21 @@ impl Dataset {
         let n = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
         let n_padded = padded_n(n);
 
+        let nlist = u32::from_le_bytes(mmap[16..20].try_into().unwrap());
+        if nlist as usize != NLIST {
+            return Err(DatasetError::BadNlist(nlist));
+        }
+
         let labels_off = HEADER_SIZE;
-        let vectors_off = align_up(labels_off + n, ALIGN);
+        let centroids_off = align_up(labels_off + n, ALIGN);
+        let boundaries_off = align_up(
+            centroids_off + DIM * NLIST * std::mem::size_of::<i16>(),
+            ALIGN,
+        );
+        let vectors_off = align_up(
+            boundaries_off + (NLIST + 1) * std::mem::size_of::<u32>(),
+            ALIGN,
+        );
         let expected = vectors_off + DIM * n_padded * std::mem::size_of::<i16>();
 
         if mmap.len() < expected {
@@ -107,14 +129,20 @@ impl Dataset {
             });
         }
 
+        // SAFETY: offsets validados via expected ≤ mmap.len().
         let labels = unsafe { mmap.as_ptr().add(labels_off) };
+        let centroids = unsafe { mmap.as_ptr().add(centroids_off).cast::<i16>() };
+        let boundaries = unsafe { mmap.as_ptr().add(boundaries_off).cast::<u32>() };
         let vectors = unsafe { mmap.as_ptr().add(vectors_off).cast::<i16>() };
 
         Ok(Self {
             _mmap: mmap,
             n,
             n_padded,
+            nlist: NLIST,
             labels,
+            centroids,
+            boundaries,
             vectors,
         })
     }
@@ -125,9 +153,7 @@ impl Dataset {
         self.n
     }
 
-    /// `n` arredondado pra múltiplo de SIMD_LANES. Hot path SIMD lê
-    /// `n_padded` lanes, posições além de `n` contêm valores que produzem
-    /// distância grande o suficiente pra serem descartadas pelo TopK.
+    /// `n` arredondado pra múltiplo de SIMD_LANES.
     #[inline]
     #[must_use]
     pub fn n_padded(&self) -> usize {
@@ -136,11 +162,17 @@ impl Dataset {
 
     #[inline]
     #[must_use]
+    pub fn nlist(&self) -> usize {
+        self.nlist
+    }
+
+    #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.n == 0
     }
 
-    /// `true` se vetor `i` é fraude. Posições além de `n` retornam `false`.
+    /// `true` se vetor `i` (na ordem reordenada por cluster) é fraude.
     #[inline]
     #[must_use]
     pub fn is_fraud(&self, i: usize) -> bool {
@@ -151,7 +183,7 @@ impl Dataset {
         unsafe { *self.labels.add(i) == LABEL_FRAUD }
     }
 
-    /// Slice contíguo da dimensão `d`, tamanho = `n_padded`.
+    /// Slice contíguo da dimensão `d` dos vetores reordenados, tamanho = `n_padded`.
     #[inline]
     #[must_use]
     pub fn dim_column(&self, d: usize) -> &[i16] {
@@ -160,10 +192,38 @@ impl Dataset {
         unsafe { std::slice::from_raw_parts(self.vectors.add(d * self.n_padded), self.n_padded) }
     }
 
+    /// Slice contíguo da dimensão `d` dos centroides, tamanho = `nlist`.
+    #[inline]
+    #[must_use]
+    pub fn centroid_column(&self, d: usize) -> &[i16] {
+        debug_assert!(d < DIM);
+        // SAFETY: matriz SoA tem DIM colunas de tamanho nlist.
+        unsafe { std::slice::from_raw_parts(self.centroids.add(d * self.nlist), self.nlist) }
+    }
+
+    /// Range `[start, end)` de vetores pertencentes ao cluster `c`.
+    #[inline]
+    #[must_use]
+    pub fn cluster_range(&self, c: usize) -> (usize, usize) {
+        debug_assert!(c < self.nlist);
+        // SAFETY: c < nlist; boundaries tem nlist+1 entradas.
+        unsafe {
+            let start = *self.boundaries.add(c) as usize;
+            let end = *self.boundaries.add(c + 1) as usize;
+            (start, end)
+        }
+    }
+
     #[inline]
     #[must_use]
     pub fn vectors_ptr(&self) -> *const i16 {
         self.vectors
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn centroids_ptr(&self) -> *const i16 {
+        self.centroids
     }
 }
 

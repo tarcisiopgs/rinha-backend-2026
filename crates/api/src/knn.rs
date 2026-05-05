@@ -1,7 +1,12 @@
-//! Busca k-NN brute-force sobre dataset SoA i16 (f32 quantizado). Dispatcha
-//! pra AVX2 quando disponível, fallback escalar pra outras arquiteturas.
+//! Busca k-NN com índice IVF (inverted file). Para cada query:
+//!   1. Calcula distância contra os `NLIST` centroides;
+//!   2. Seleciona os `N_PROBES` mais próximos;
+//!   3. Faz brute-force só dentro desses clusters (~24k vetores em vez de 3M);
+//!   4. TopK final + contagem de fraudes.
+//!
+//! AVX2 quando disponível; fallback escalar pra outras arquiteturas.
 
-use common::proto::{K, NULL_SENTINEL_I16, QUANT_SCALE};
+use common::proto::{K, NLIST, NULL_SENTINEL_I16, N_PROBES, QUANT_SCALE};
 use common::{Dataset, DIM};
 
 #[derive(Debug, Clone, Copy)]
@@ -67,36 +72,87 @@ pub(crate) fn quantize_query(query: &[f32; DIM]) -> [i16; DIM] {
 }
 
 /// Conta quantos dos K vizinhos mais próximos são `fraud`.
-///
-/// Returns valor em `0..=K` que mapeia diretamente em
-/// `fraud_score = count / 5.0` (= bucket index em `SCORE_BUCKETS`).
 pub fn count_fraud_neighbors(query: &[f32; DIM], dataset: &Dataset) -> u8 {
     let q = quantize_query(query);
+
+    // 1. Selecciona os N_PROBES centroides mais próximos.
+    let probes = select_probes(&q, dataset);
+
+    // 2. Brute-force interno em cada cluster.
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: AVX2 detectado em runtime.
-            return unsafe { crate::knn_avx2::count_fraud_neighbors_avx2(&q, dataset) };
+            return unsafe { crate::knn_avx2::count_fraud_in_probes_avx2(&q, dataset, &probes) };
         }
     }
-    count_fraud_neighbors_scalar(&q, dataset)
+    count_fraud_in_probes_scalar(&q, dataset, &probes)
 }
 
-pub(crate) fn count_fraud_neighbors_scalar(query: &[i16; DIM], dataset: &Dataset) -> u8 {
-    let mut top = TopK::new();
-    let n = dataset.len();
+/// Calcula L2² query × cada centroide e retorna os `N_PROBES` ids mais perto,
+/// ordenados arbitrariamente (a ordem dentro do conjunto não importa).
+fn select_probes(query: &[i16; DIM], dataset: &Dataset) -> [u32; N_PROBES] {
+    let columns: [&[i16]; DIM] = std::array::from_fn(|d| dataset.centroid_column(d));
+    debug_assert_eq!(columns[0].len(), NLIST);
 
-    let columns: [&[i16]; DIM] = std::array::from_fn(|d| dataset.dim_column(d));
+    let mut top = [(i32::MAX, 0_u32); N_PROBES];
+    let mut len = 0_usize;
 
-    for i in 0..n {
+    for c in 0..NLIST {
         let mut acc: i32 = 0;
         for d in 0..DIM {
-            // SAFETY: cada coluna tem len = n_padded ≥ n.
-            let v = unsafe { *columns[d].get_unchecked(i) };
+            // SAFETY: c < NLIST = column.len().
+            let v = unsafe { *columns[d].get_unchecked(c) };
             let diff = i32::from(query[d]) - i32::from(v);
             acc += diff * diff;
         }
-        top.try_push(acc, i as u32);
+
+        if len < N_PROBES {
+            top[len] = (acc, c as u32);
+            len += 1;
+            continue;
+        }
+        // Substitui o pior caso se o atual for menor.
+        let mut max_pos = 0;
+        let mut max_val = top[0].0;
+        for (i, entry) in top.iter().enumerate().take(N_PROBES).skip(1) {
+            if entry.0 > max_val {
+                max_val = entry.0;
+                max_pos = i;
+            }
+        }
+        if acc < max_val {
+            top[max_pos] = (acc, c as u32);
+        }
+    }
+
+    let mut out = [0_u32; N_PROBES];
+    for (i, t) in top.iter().enumerate() {
+        out[i] = t.1;
+    }
+    out
+}
+
+fn count_fraud_in_probes_scalar(
+    query: &[i16; DIM],
+    dataset: &Dataset,
+    probes: &[u32; N_PROBES],
+) -> u8 {
+    let mut top = TopK::new();
+    let columns: [&[i16]; DIM] = std::array::from_fn(|d| dataset.dim_column(d));
+
+    for &c in probes {
+        let (start, end) = dataset.cluster_range(c as usize);
+        for i in start..end {
+            let mut acc: i32 = 0;
+            for d in 0..DIM {
+                // SAFETY: i < end ≤ n ≤ n_padded = column.len().
+                let v = unsafe { *columns[d].get_unchecked(i) };
+                let diff = i32::from(query[d]) - i32::from(v);
+                acc += diff * diff;
+            }
+            top.try_push(acc, i as u32);
+        }
     }
 
     let mut count = 0_u8;
