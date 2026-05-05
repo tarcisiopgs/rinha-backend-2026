@@ -1,10 +1,13 @@
 name: rinha-2026
 
 # Compose oficial de submissão. Setup inspirado no top-1 (thiagorigonatti):
-#   - HAProxy como LB (battle-tested, http-reuse always)
-#   - UDS via named volume (não tmpfs) entre LB ↔ APIs
+#   - HAProxy 3.3 como LB (battle-tested, http-reuse always)
 #   - security_opt: seccomp=unconfined nas APIs habilita io_uring no Docker
-#     (perfil padrão do Docker bloqueia io_uring_setup via seccomp)
+#     (perfil padrão do Docker bloqueia io_uring_setup)
+#
+# Comunicação api↔lb via TCP intra-bridge — UDS sobre named volume falhou no
+# bench runner (health check timeout, monoio bind UDS retorna ENOTSUP mesmo
+# com seccomp liberado).
 #
 # Total: 1 CPU, 350 MB. 2 APIs com 0.40 CPU / 150 MB cada + HAProxy com
 # 0.20 CPU / 50 MB. ulimits nofile=65535 evita exhaustion sob k6.
@@ -17,11 +20,9 @@ services:
       - seccomp=unconfined
     entrypoint: ["/usr/local/bin/api"]
     environment:
-      API_LISTEN: unix:/sockets/api1.sock
+      API_LISTEN: tcp:0.0.0.0:9000
       DATASET_PATH: /data/references.bin
       RUST_LOG: warn
-    volumes:
-      - sockets:/sockets
     ulimits:
       nofile:
         soft: 65535
@@ -41,11 +42,9 @@ services:
       - seccomp=unconfined
     entrypoint: ["/usr/local/bin/api"]
     environment:
-      API_LISTEN: unix:/sockets/api2.sock
+      API_LISTEN: tcp:0.0.0.0:9000
       DATASET_PATH: /data/references.bin
       RUST_LOG: warn
-    volumes:
-      - sockets:/sockets
     ulimits:
       nofile:
         soft: 65535
@@ -63,7 +62,6 @@ services:
     platform: linux/amd64
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - sockets:/sockets
     ulimits:
       nofile:
         soft: 65535
@@ -80,9 +78,6 @@ services:
           memory: "50MB"
     networks:
       - rinha
-
-volumes:
-  sockets:
 
 networks:
   rinha:
