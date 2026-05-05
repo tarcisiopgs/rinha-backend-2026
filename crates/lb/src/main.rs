@@ -154,17 +154,25 @@ where
     R: AsyncReadRent,
     W: AsyncWriteRentExt,
 {
-    let mut buf = bytes::BytesMut::with_capacity(8192);
+    // Vec<u8> + clear por iteração mantém a capacity intacta. O padrão antigo
+    // com `BytesMut::split().freeze()` movia a alocação inteira pro chunk de
+    // saída e deixava `buf` com capacity 0 — o `read` seguinte retornava 0
+    // (sem espaço) e o LB interpretava como EOF, fechando conexões keep-alive
+    // de cliente ↔ LB ↔ upstream prematuramente.
+    const BUF: usize = 8192;
+    let mut buf: Vec<u8> = Vec::with_capacity(BUF);
     loop {
-        let take = std::mem::replace(&mut buf, bytes::BytesMut::new());
+        let take = std::mem::take(&mut buf);
         let (res, returned) = r.read(take).await;
         buf = returned;
         let n = res?;
         if n == 0 {
             return Ok(());
         }
-        let chunk = buf.split().freeze();
-        let (res, _) = w.write_all(chunk).await;
+        let to_write = std::mem::take(&mut buf);
+        let (res, returned) = w.write_all(to_write).await;
         res?;
+        buf = returned;
+        buf.clear();
     }
 }
