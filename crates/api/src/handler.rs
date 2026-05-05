@@ -49,7 +49,7 @@ fn handle_fraud_score(
     dataset: &Dataset,
     responses: &ResponseTable,
 ) -> Response<Full<Bytes>> {
-    let mut known = Vec::new();
+    let mut known = Vec::with_capacity(8);
     let parse_result = json::parse(body, &mut known);
 
     let count = match parse_result {

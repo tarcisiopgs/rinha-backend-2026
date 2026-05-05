@@ -34,6 +34,8 @@ pub const NULL_SENTINEL_I16: i16 = -4096;
 pub const NLIST: usize = 1024;
 
 /// Quantos clusters mais próximos são escaneados em cada query (recall vs custo).
-/// Em 1024 clusters de ~3k vetores cada, 8 clusters cobrem ~24k vetores
-/// (~0.8% do dataset) e mantêm recall@5 acima de 95% empiricamente.
-pub const N_PROBES: usize = 8;
+/// Em 1024 clusters de ~3k vetores cada, 4 clusters cobrem ~12k vetores
+/// (~0.4% do dataset). Empiricamente o recall@5 cai poucos pontos vs N=8 e
+/// a redução no compute é crítica no Mac Mini Late 2014 (2 cores) que roda
+/// o bench oficial.
+pub const N_PROBES: usize = 4;
