@@ -1,12 +1,11 @@
 name: rinha-2026
 
-# Compose oficial de submissão — referencia imagem pré-construída em ghcr.io
-# (linux/amd64, RUSTFLAGS=-C target-cpu=haswell -C target-feature=+avx2,+fma,
-# dataset embutido em /data/references.bin).
+# Compose oficial de submissão. APIs (Rust + monoio + IVF + AVX2 i16) servem
+# atrás de um nginx fazendo round-robin TCP. nginx é mais robusto que o LB
+# Rust caseiro sob carga de 250 VUs concorrentes do k6 (oficial).
 #
-# Total: 1 CPU, 350 MB. 2 APIs com 0.40 CPU / 160 MB cada + LB com 0.20 CPU
-# / 30 MB. ulimits nofile=65535 evita exhaustion de fds quando o k6 abre 250
-# VUs concorrentes durante o ramp.
+# Total: 1 CPU, 350 MB. 2 APIs com 0.40 CPU / 160 MB cada + LB nginx com
+# 0.20 CPU / 30 MB.
 
 services:
   api1:
@@ -52,14 +51,10 @@ services:
       - rinha
 
   lb:
-    image: ghcr.io/tarcisiopgs/rinha-backend-2026:latest
+    image: nginx:1.27-alpine
     platform: linux/amd64
-    entrypoint: ["/usr/local/bin/lb"]
-    environment:
-      LB_LISTEN: 0.0.0.0:9999
-      LB_UPSTREAMS: tcp:api1:9000,tcp:api2:9000
-      RUST_LOG: warn
-      MONOIO_DRIVER: legacy
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     ulimits:
       nofile:
         soft: 65535
