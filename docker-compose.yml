@@ -1,16 +1,10 @@
 name: rinha-2026
 
-# Compose oficial de submissão. Setup inspirado no top-1 (thiagorigonatti):
-#   - HAProxy 3.3 como LB (battle-tested, http-reuse always)
-#   - security_opt: seccomp=unconfined nas APIs habilita io_uring no Docker
-#     (perfil padrão do Docker bloqueia io_uring_setup)
-#
-# Comunicação api↔lb via TCP intra-bridge — UDS sobre named volume falhou no
-# bench runner (health check timeout, monoio bind UDS retorna ENOTSUP mesmo
-# com seccomp liberado).
-#
-# Total: 1 CPU, 350 MB. 2 APIs com 0.40 CPU / 150 MB cada + HAProxy com
-# 0.20 CPU / 50 MB. ulimits nofile=65535 evita exhaustion sob k6.
+# Compose oficial de submissão. CPU split inspirado em lothyriel/rinha_2026
+# (Rust + axum que passou no Mac Mini): LB com 0.4 CPU pra drainar a accept
+# queue rápido sob k6, APIs com 0.3 CPU cada. APIs com 150 MB cada + HAProxy
+# 50 MB = 350 MB. 0.3+0.3+0.4 = 1.0 CPU. ulimits nofile=65535 evita
+# exhaustion no ramp.
 
 services:
   api1:
@@ -30,7 +24,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
+          cpus: "0.30"
           memory: "150MB"
     networks:
       - rinha
@@ -52,7 +46,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
+          cpus: "0.30"
           memory: "150MB"
     networks:
       - rinha
@@ -74,7 +68,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20"
+          cpus: "0.40"
           memory: "50MB"
     networks:
       - rinha
