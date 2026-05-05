@@ -1,0 +1,7 @@
+{
+    "participants": ["Tarcísio Pedro"],
+    "social": ["https://github.com/tarcisiopgs"],
+    "source-code-repo": "https://github.com/tarcisiopgs/rinha-backend-2026",
+    "stack": ["rust", "monoio", "io_uring", "avx2"],
+    "open_to_work": false
+}

@@ -1,0 +1,77 @@
+name: rinha-2026
+
+# Compose oficial de submissão — referencia imagem pré-construída em ghcr.io
+# (linux/amd64, RUSTFLAGS=-C target-cpu=haswell -C target-feature=+avx2,+fma,
+# dataset embutido em /data/references.bin).
+#
+# Total: 1 CPU, 350 MB. 2 APIs com 0.40 CPU / 170 MB cada + LB com 0.20 CPU
+# / 10 MB. Engine da Rinha bate na porta 9999 (LB).
+
+services:
+  api1:
+    image: ghcr.io/tarcisiopgs/rinha-backend-2026:latest
+    entrypoint: ["/usr/local/bin/api"]
+    environment:
+      API_LISTEN: unix:/sockets/api1.sock
+      DATASET_PATH: /data/references.bin
+      RUST_LOG: warn
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "170MB"
+    networks:
+      - rinha
+
+  api2:
+    image: ghcr.io/tarcisiopgs/rinha-backend-2026:latest
+    entrypoint: ["/usr/local/bin/api"]
+    environment:
+      API_LISTEN: unix:/sockets/api2.sock
+      DATASET_PATH: /data/references.bin
+      RUST_LOG: warn
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "170MB"
+    networks:
+      - rinha
+
+  lb:
+    image: ghcr.io/tarcisiopgs/rinha-backend-2026:latest
+    entrypoint: ["/usr/local/bin/lb"]
+    environment:
+      LB_LISTEN: 0.0.0.0:9999
+      LB_UPSTREAMS: unix:/sockets/api1.sock,unix:/sockets/api2.sock
+      RUST_LOG: warn
+    ports:
+      - "9999:9999"
+    depends_on:
+      - api1
+      - api2
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: "10MB"
+    networks:
+      - rinha
+
+volumes:
+  sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=10m"
+
+networks:
+  rinha:
+    driver: bridge
