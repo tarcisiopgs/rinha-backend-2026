@@ -16,13 +16,13 @@ Submissão da [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-
 ## Stack
 
 - **Linguagem:** Rust 1.82 (edition 2021)
-- **Runtime async:** [monoio](https://github.com/bytedance/monoio) (io_uring nativo, single-threaded)
-- **Comunicação LB↔API:** Unix Domain Sockets (sem TCP loopback)
-- **Layout dataset:** SoA (Structure of Arrays), vetores quantizados i16, label binário u8
-- **Sentinela:** `i16::MIN` para `last_transaction: null` (índices 5/6 do vetor)
+- **Runtime async:** [monoio](https://github.com/bytedance/monoio) (io_uring nativo, single-threaded, fallback legacy)
+- **Comunicação LB↔API:** TCP loopback intra-bridge (`tcp:apiN:9000`)
+- **Layout dataset:** SoA (Structure of Arrays) f32, label binário u8, mmap
+- **Sentinela:** `f32::NAN` para `last_transaction: null` (índices 5/6 do vetor)
 - **HTTP parser:** manual com `memchr`, sem framework
 - **Respostas:** 12 buffers HTTP pré-montados no startup (6 score buckets × 2 approved/denied)
-- **SIMD:** AVX2 manual planejado (`target-cpu=haswell` no build flags)
+- **SIMD:** AVX2 + FMA no hot path do k-NN (`target-cpu=haswell`, `+avx2,+fma`)
 
 ## Arquitetura
 
@@ -32,10 +32,10 @@ Submissão da [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-
         ┌─────▼─────┐
         │    lb     │  round-robin atômico, sem lógica
         └──┬─────┬──┘
-           │     │      Unix Domain Socket
+           │     │      tcp:apiN:9000 (bridge network)
         ┌──▼─┐ ┌─▼──┐
-        │api1│ │api2│   monoio + io_uring
-        └────┘ └────┘   dataset mmap (SoA i16)
+        │api1│ │api2│   monoio + io_uring (fallback legacy)
+        └────┘ └────┘   dataset mmap (SoA f32 + AVX2/FMA)
 ```
 
 ## Layout do repositório
@@ -43,9 +43,9 @@ Submissão da [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-
 ```
 crates/
 ├── common/      Dataset (mmap), normalização, MCC, time, SIMD, proto
-├── api/         Servidor HTTP + JSON parser + KNN
-├── lb/          Load balancer TCP → UDS, round-robin
-└── preprocess/  references.json.gz → references.bin (i16 SoA)
+├── api/         Servidor HTTP + JSON parser + KNN escalar + AVX2
+├── lb/          Load balancer TCP → TCP/UDS upstream, round-robin
+└── preprocess/  references.json.gz → references.bin (f32 SoA)
 
 data/            Binários do dataset (gitignored)
 info.json        Metadados de submissão
@@ -57,10 +57,8 @@ info.json        Metadados de submissão
 
 - Rust 1.82+ (instalado via `rust-toolchain.toml`)
 - Docker + Docker Compose
-- 3 arquivos do desafio em `data/`:
+- Arquivo do desafio em `data/`:
   - `references.json.gz`
-  - `mcc_risk.json`
-  - `normalization.json`
 
 ### Comandos
 
@@ -79,7 +77,7 @@ QEMU em Apple Silicon não emula AVX2 corretamente (autovec do `f32` div gera bi
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
-Override desliga `target-cpu=haswell`, força `MONOIO_DRIVER=legacy` e troca UDS por TCP loopback (volume Docker Desktop não suporta bind UDS). A imagem de submissão (sem override) mantém AVX2 + io_uring + UDS.
+Override desliga `target-cpu=haswell` e força `MONOIO_DRIVER=legacy`. A imagem de submissão (sem override) mantém AVX2 + FMA + io_uring quando disponível.
 
 ### Validação manual
 
@@ -101,7 +99,7 @@ curl -X POST http://localhost:9999/fraud-score \
 
 ### MCC risk e normalization constants embedded
 
-A spec garante que `mcc_risk.json` e `normalization.json` não mudam durante o teste. Para zerar I/O no startup, os defaults estão hardcoded em `common::mcc::McCRiskTable::default()` e `common::NormalizationConfig::default()` — espelhando o conteúdo oficial dos arquivos.
+A spec garante que `mcc_risk.json` e `normalization.json` não mudam durante o teste. Para zerar I/O no startup, os defaults estão hardcoded em `common::mcc::McCRiskTable::default()` e `common::NormalizationConfig::default()` — espelhando o conteúdo oficial.
 
 ### Fallback de erro = `200 approved=true score=0.0`
 
@@ -113,15 +111,16 @@ Pesos da fórmula de detecção: FP=1, FN=3, **HTTP error=5**. Em qualquer falha
 - Single-threaded por design → casa com 0.4 CPU sem custo de scheduler multi-thread
 - Sem `Send` bound em tasks → mais flexível
 
-### Por que UDS e não TCP loopback?
+### Por que TCP loopback e não UDS?
 
-Top 2 do leaderboard (Rust) explicitamente cita: ~40-60µs economizados por request. Em p99 ≤ 1ms, 50µs equivale a 5% do orçamento.
+UDS sobre tmpfs falha com `ENOTSUP` no `bind(2)` quando o runner do smoke test cai no driver legacy do monoio (sem io_uring). TCP intra-bridge funciona em qualquer kernel/runner com overhead `~µs` no loopback Docker. Em produção real (kernel 6.x, io_uring nativo) o ganho de UDS é marginal versus o custo de portabilidade.
 
-### Por que i16 SoA?
+### Por que f32 SoA?
 
-- Espaço: 14 × 2 bytes × 3M = 84 MB. Cabe folgado em 350 MB.
+- Espaço: 14 × 4 bytes × 3M = 168 MB. Cabe folgado em 350 MB.
 - Cache-friendly: dot product itera por dimensão; SoA mantém cada dimensão contígua.
-- AVX2: `_mm256_madd_epi16` consome 16 lanes i16 por ciclo.
+- AVX2/FMA: `_mm256_fmadd_ps` consome 8 lanes f32 por ciclo, sem desempacotamento.
+- Compatível com `f32::NAN` como sentinela de campo ausente.
 
 ### Por que respostas pré-montadas?
 
@@ -131,40 +130,33 @@ Top 2 do leaderboard (Rust) explicitamente cita: ~40-60µs economizados por requ
 
 - [x] Scaffold com workspace, Dockerfile multi-stage, CI
 - [x] Schema do payload (5 sub-objetos + `last_transaction: null`)
-- [x] Normalização das 14 dimensões + sentinela `-1`
+- [x] Normalização das 14 dimensões + sentinela `NaN`
 - [x] Tabela MCC + constantes embedded
 - [x] Parser HTTP manual + 12 respostas pré-montadas
-- [x] Dataset SoA i16 + mmap + label binário u8
+- [x] Dataset SoA f32 + mmap + label binário u8
 - [x] KNN brute-force escalar baseline
+- [x] AVX2 + FMA dot product no hot path
 - [x] Fallback `200 approved=true` em erro
+- [x] Imagem pública em `ghcr.io/tarcisiopgs/rinha-backend-2026:latest` com dataset embutido
+- [x] Branch `submission` + `docker-compose.yml` (TCP intra-bridge)
+- [x] PR `participants/tarcisiopgs.json` mergeado no repo do desafio
+- [x] Issue `rinha/test` aberta para bench oficial
 - [ ] Parser JSON manual no hot path (substituir `serde_json`)
-- [ ] AVX2 dot product i16 → i32 em batch (`_mm256_madd_epi16`)
 - [ ] IVF index (kmeans clusters, nlist tuning) — brute-force em 3M é caro
 - [ ] Quantização i8 (avaliar perda de recall)
 - [ ] Huge pages 2MB pro mmap do dataset
 - [ ] Pin de thread em CPU (sched_setaffinity) + `SCHED_FIFO` se permitido
 - [ ] LB com `splice(2)` ao invés de copy bidirecional
 - [ ] Profile com `perf stat` + flamegraph em hardware do desafio
-- [ ] Branch `submission` com docker-compose + imagem em ghcr.io
-- [ ] PR em `participants/tarcisiopgs.json` no repo do desafio
-- [ ] Issue `rinha/test` para teste oficial
 
 ## Submissão
 
 A spec exige duas branches:
 
 - `main` — código-fonte (esta branch)
-- `submission` — apenas `docker-compose.yml` + `info.json` + artefatos de runtime, com imagens públicas em registry
+- `submission` — apenas `docker-compose.yml` + `info.json`, referenciando imagem pública em `ghcr.io`
 
 Detalhes em [SUBMISSAO.md](https://github.com/zanfranceschi/rinha-de-backend-2026/blob/main/docs/br/SUBMISSAO.md).
-
-## Referências
-
-- [README oficial — Rinha 2026](https://github.com/zanfranceschi/rinha-de-backend-2026/blob/main/docs/br/README.md)
-- [Top 1 — thiagorigonatti (C + io_uring)](https://github.com/thiagorigonatti/rinha-2026)
-- [Top 2 — jairoblatt (Rust + AVX2)](https://github.com/jairoblatt/rinha-2026-rust)
-- [Top 3 — viniciusdsandrade (C++ + IVF)](https://github.com/viniciusdsandrade/rinha-de-backend-2026)
-- [Apollo Rust Best Practices](https://github.com/apollographql/rust-best-practices)
 
 ## Licença
 
