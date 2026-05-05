@@ -50,8 +50,7 @@ impl TopK {
 pub fn count_fraud_neighbors(query: &[f32; DIM], dataset: &Dataset) -> u8 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("fma")
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
             // SAFETY: AVX2 + FMA detectados em runtime.
             return unsafe { crate::knn_avx2::count_fraud_neighbors_avx2(query, dataset) };
@@ -93,7 +92,10 @@ mod tests {
     #[test]
     fn topk_keeps_smallest_k() {
         let mut t = TopK::new();
-        for (i, d) in [10.0_f32, 1.0, 50.0, 3.0, 8.0, 2.0, 100.0].iter().enumerate() {
+        for (i, d) in [10.0_f32, 1.0, 50.0, 3.0, 8.0, 2.0, 100.0]
+            .iter()
+            .enumerate()
+        {
             t.try_push(*d, i as u32);
         }
         let mut dists = t.dists;
