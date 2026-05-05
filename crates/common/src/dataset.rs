@@ -1,23 +1,24 @@
-//! Dataset de referência em SoA f32 + label binário.
+//! Dataset de referência em SoA i16 (f32 quantizado por `QUANT_SCALE`) + label binário.
 //!
 //! Formato binário (little-endian, alinhado a 64 bytes pra AVX2):
 //! ```text
 //! HEADER (32 bytes)
 //!   magic        u32  = 0x52424B33 ("RBK3")
-//!   version      u32  = 3
+//!   version      u32  = 4
 //!   dim          u32  = 14
 //!   n            u32  = 3_000_000
 //!   _reserved    [u8; 16]
 //!
 //! LABELS  (n bytes)             // u8: 0 = legit, 1 = fraud
 //! PAD     (até múltiplo de 64)
-//! VECTORS (DIM * n_padded * 4)  // f32 SoA: dim 0 todos n_padded, dim 1 todos n_padded, ...
-//!                               // Sentinela `-1.0` mantida do payload (last_transaction null).
+//! VECTORS (DIM * n_padded * 2)  // i16 SoA: dim 0 todos n_padded, dim 1 todos n_padded, ...
+//!                               // Sentinela `NULL_SENTINEL_I16` (-4096) mantida do payload.
 //! ```
 //!
-//! `n_padded = ceil(n / 8) * 8` permite carregar 8 lanes f32 (256-bit AVX2)
-//! sem checagem de bounds no hot path. Posições extras recebem distância
-//! infinita via valores fora do espaço normalizado (TopK descarta).
+//! `n_padded = ceil(n / 8) * 8` permite carregar 8 lanes i16 (128-bit) e
+//! expandir pra 8 lanes i32 (256-bit AVX2) sem checagem de bounds no hot path.
+//! Posições extras recebem `0` — distância arbitrária mas dentro do range i32;
+//! TopK ignora os índices ≥ n via filtro pós-cálculo.
 
 use std::path::Path;
 
@@ -26,7 +27,7 @@ use memmap2::Mmap;
 use crate::proto::DIM;
 
 pub const MAGIC: u32 = 0x5242_4B33;
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 pub const HEADER_SIZE: usize = 32;
 pub const LABEL_LEGIT: u8 = 0;
 pub const LABEL_FRAUD: u8 = 1;
@@ -57,7 +58,7 @@ pub struct Dataset {
     n: usize,
     n_padded: usize,
     labels: *const u8,
-    vectors: *const f32,
+    vectors: *const i16,
 }
 
 // SAFETY: mmap imutável; ponteiros vivem enquanto _mmap vive. Sem mutação.
@@ -97,7 +98,7 @@ impl Dataset {
 
         let labels_off = HEADER_SIZE;
         let vectors_off = align_up(labels_off + n, ALIGN);
-        let expected = vectors_off + DIM * n_padded * std::mem::size_of::<f32>();
+        let expected = vectors_off + DIM * n_padded * std::mem::size_of::<i16>();
 
         if mmap.len() < expected {
             return Err(DatasetError::Truncated {
@@ -107,7 +108,7 @@ impl Dataset {
         }
 
         let labels = unsafe { mmap.as_ptr().add(labels_off) };
-        let vectors = unsafe { mmap.as_ptr().add(vectors_off).cast::<f32>() };
+        let vectors = unsafe { mmap.as_ptr().add(vectors_off).cast::<i16>() };
 
         Ok(Self {
             _mmap: mmap,
@@ -153,7 +154,7 @@ impl Dataset {
     /// Slice contíguo da dimensão `d`, tamanho = `n_padded`.
     #[inline]
     #[must_use]
-    pub fn dim_column(&self, d: usize) -> &[f32] {
+    pub fn dim_column(&self, d: usize) -> &[i16] {
         debug_assert!(d < DIM);
         // SAFETY: matriz SoA tem DIM colunas de tamanho n_padded.
         unsafe { std::slice::from_raw_parts(self.vectors.add(d * self.n_padded), self.n_padded) }
@@ -161,7 +162,7 @@ impl Dataset {
 
     #[inline]
     #[must_use]
-    pub fn vectors_ptr(&self) -> *const f32 {
+    pub fn vectors_ptr(&self) -> *const i16 {
         self.vectors
     }
 }

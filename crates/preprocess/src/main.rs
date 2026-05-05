@@ -1,5 +1,6 @@
 //! Pré-processador offline. Lê `references.json.gz` (3M vetores rotulados) e
-//! produz `references.bin` no formato SoA f32 esperado pela API.
+//! produz `references.bin` no formato SoA i16 (f32 quantizado por
+//! `QUANT_SCALE`) esperado pela API.
 //!
 //! Uso: `preprocess <input.json.gz> <output.bin>`
 
@@ -11,7 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use common::dataset::{
     align_up, padded_n, ALIGN, HEADER_SIZE, LABEL_FRAUD, LABEL_LEGIT, MAGIC, VERSION,
 };
-use common::proto::{DIM, NULL_SENTINEL};
+use common::proto::{DIM, NULL_SENTINEL_I16, QUANT_SCALE};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 
@@ -46,15 +47,10 @@ fn main() -> Result<()> {
     eprintln!("carregados {n} vetores (padded={n_padded})");
 
     let mut labels = vec![0_u8; n];
-    let mut soa = vec![0.0_f32; DIM * n_padded];
-
-    // Posições padding (n..n_padded) recebem sentinela amplificada — distância
-    // pra qualquer query realista fica gigante, garantindo descarte pelo TopK.
-    for d in 0..DIM {
-        for i in n..n_padded {
-            soa[d * n_padded + i] = 1e9;
-        }
-    }
+    // SoA i16: posições padding (n..n_padded) ficam em 0. O hot path filtra
+    // índices ≥ n após o TopK, então o valor não importa contanto que não
+    // cause overflow no acumulador i32 da soma de 14 quadrados.
+    let mut soa = vec![0_i16; DIM * n_padded];
 
     let mut fraud_count = 0_usize;
     for (i, r) in refs.iter().enumerate() {
@@ -75,7 +71,11 @@ fn main() -> Result<()> {
 
         for d in 0..DIM {
             let value = r.vector[d];
-            soa[d * n_padded + i] = if value < 0.0 { NULL_SENTINEL } else { value };
+            soa[d * n_padded + i] = if value < 0.0 {
+                NULL_SENTINEL_I16
+            } else {
+                quantize(value)
+            };
         }
     }
     drop(refs);
@@ -105,17 +105,32 @@ fn main() -> Result<()> {
     let bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(
             soa.as_ptr().cast::<u8>(),
-            soa.len() * std::mem::size_of::<f32>(),
+            soa.len() * std::mem::size_of::<i16>(),
         )
     };
     w.write_all(bytes)?;
     w.flush()?;
 
-    let total = vectors_off + soa.len() * 4;
+    let total = vectors_off + soa.len() * std::mem::size_of::<i16>();
     eprintln!(
         "ok ({} bytes / {:.2} MB)",
         total,
         total as f64 / (1024.0 * 1024.0)
     );
     Ok(())
+}
+
+/// Quantiza f32 normalizado em `[0, 1]` para i16 multiplicando por
+/// `QUANT_SCALE` e arredondando. Clampeia em `[-32768, 32767]` por segurança
+/// contra valores fora do intervalo esperado.
+#[inline]
+fn quantize(value: f32) -> i16 {
+    let scaled = (value * QUANT_SCALE).round();
+    if scaled <= f32::from(i16::MIN) {
+        i16::MIN
+    } else if scaled >= f32::from(i16::MAX) {
+        i16::MAX
+    } else {
+        scaled as i16
+    }
 }

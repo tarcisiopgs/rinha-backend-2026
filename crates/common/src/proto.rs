@@ -19,3 +19,12 @@ pub const NULL_SENTINEL: f32 = -1.0;
 
 /// Default de risco MCC quando categoria não está em `mcc_risk.json`.
 pub const MCC_DEFAULT_RISK: f32 = 0.5;
+
+/// Fator de quantização f32 → i16 do dataset. Range pós-normalização é
+/// `[-1.0, 1.0]`; com SCALE 4096 cada valor cabe em `[-4096, 4096]`. Diff
+/// entre dois pontos cabe em i16; quadrado cabe em i32; soma de DIM=14
+/// quadrados também cabe em i32 (≈940M, max i32 ≈2.1G).
+pub const QUANT_SCALE: f32 = 4096.0;
+
+/// `NULL_SENTINEL` (-1.0) quantizado.
+pub const NULL_SENTINEL_I16: i16 = -4096;

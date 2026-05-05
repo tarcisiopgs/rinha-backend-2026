@@ -1,12 +1,12 @@
-//! Busca k-NN brute-force sobre dataset SoA f32. Dispatcha pra AVX2 quando
-//! disponível, fallback escalar pra outras arquiteturas.
+//! Busca k-NN brute-force sobre dataset SoA i16 (f32 quantizado). Dispatcha
+//! pra AVX2 quando disponível, fallback escalar pra outras arquiteturas.
 
-use common::proto::K;
+use common::proto::{K, NULL_SENTINEL_I16, QUANT_SCALE};
 use common::{Dataset, DIM};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TopK {
-    pub dists: [f32; K],
+    pub dists: [i32; K],
     pub indices: [u32; K],
     pub len: usize,
 }
@@ -14,14 +14,14 @@ pub(crate) struct TopK {
 impl TopK {
     pub(crate) fn new() -> Self {
         Self {
-            dists: [f32::INFINITY; K],
+            dists: [i32::MAX; K],
             indices: [0; K],
             len: 0,
         }
     }
 
     #[inline]
-    pub(crate) fn try_push(&mut self, dist: f32, idx: u32) {
+    pub(crate) fn try_push(&mut self, dist: i32, idx: u32) {
         if self.len < K {
             self.dists[self.len] = dist;
             self.indices[self.len] = idx;
@@ -43,34 +43,57 @@ impl TopK {
     }
 }
 
+/// Quantiza vetor de query f32 ([0, 1] com -1 como sentinela) para i16
+/// usando o mesmo `QUANT_SCALE` aplicado no dataset offline.
+#[inline]
+pub(crate) fn quantize_query(query: &[f32; DIM]) -> [i16; DIM] {
+    let mut q = [0_i16; DIM];
+    for d in 0..DIM {
+        let v = query[d];
+        q[d] = if v < 0.0 {
+            NULL_SENTINEL_I16
+        } else {
+            let scaled = (v * QUANT_SCALE).round();
+            if scaled <= f32::from(i16::MIN) {
+                i16::MIN
+            } else if scaled >= f32::from(i16::MAX) {
+                i16::MAX
+            } else {
+                scaled as i16
+            }
+        };
+    }
+    q
+}
+
 /// Conta quantos dos K vizinhos mais próximos são `fraud`.
 ///
 /// Returns valor em `0..=K` que mapeia diretamente em
 /// `fraud_score = count / 5.0` (= bucket index em `SCORE_BUCKETS`).
 pub fn count_fraud_neighbors(query: &[f32; DIM], dataset: &Dataset) -> u8 {
+    let q = quantize_query(query);
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
-        {
-            // SAFETY: AVX2 + FMA detectados em runtime.
-            return unsafe { crate::knn_avx2::count_fraud_neighbors_avx2(query, dataset) };
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 detectado em runtime.
+            return unsafe { crate::knn_avx2::count_fraud_neighbors_avx2(&q, dataset) };
         }
     }
-    count_fraud_neighbors_scalar(query, dataset)
+    count_fraud_neighbors_scalar(&q, dataset)
 }
 
-pub(crate) fn count_fraud_neighbors_scalar(query: &[f32; DIM], dataset: &Dataset) -> u8 {
+pub(crate) fn count_fraud_neighbors_scalar(query: &[i16; DIM], dataset: &Dataset) -> u8 {
     let mut top = TopK::new();
     let n = dataset.len();
 
-    let columns: [&[f32]; DIM] = std::array::from_fn(|d| dataset.dim_column(d));
+    let columns: [&[i16]; DIM] = std::array::from_fn(|d| dataset.dim_column(d));
 
     for i in 0..n {
-        let mut acc = 0.0_f32;
+        let mut acc: i32 = 0;
         for d in 0..DIM {
             // SAFETY: cada coluna tem len = n_padded ≥ n.
             let v = unsafe { *columns[d].get_unchecked(i) };
-            let diff = query[d] - v;
+            let diff = i32::from(query[d]) - i32::from(v);
             acc += diff * diff;
         }
         top.try_push(acc, i as u32);
@@ -92,14 +115,11 @@ mod tests {
     #[test]
     fn topk_keeps_smallest_k() {
         let mut t = TopK::new();
-        for (i, d) in [10.0_f32, 1.0, 50.0, 3.0, 8.0, 2.0, 100.0]
-            .iter()
-            .enumerate()
-        {
+        for (i, d) in [10_i32, 1, 50, 3, 8, 2, 100].iter().enumerate() {
             t.try_push(*d, i as u32);
         }
         let mut dists = t.dists;
-        dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        assert_eq!(dists, [1.0, 2.0, 3.0, 8.0, 10.0]);
+        dists.sort();
+        assert_eq!(dists, [1, 2, 3, 8, 10]);
     }
 }

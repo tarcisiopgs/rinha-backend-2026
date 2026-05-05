@@ -18,11 +18,11 @@ Submissão da [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-
 - **Linguagem:** Rust 1.82 (edition 2021)
 - **Runtime async:** [monoio](https://github.com/bytedance/monoio) (io_uring nativo, single-threaded, fallback legacy)
 - **Comunicação LB↔API:** TCP loopback intra-bridge (`tcp:apiN:9000`)
-- **Layout dataset:** SoA (Structure of Arrays) f32, label binário u8, mmap
-- **Sentinela:** `f32::NAN` para `last_transaction: null` (índices 5/6 do vetor)
+- **Layout dataset:** SoA (Structure of Arrays) i16 (f32 quantizado por `QUANT_SCALE = 4096`), label binário u8, mmap
+- **Sentinela:** `-4096` (i16) para `last_transaction: null` (índices 5/6 do vetor)
 - **HTTP parser:** manual com `memchr`, sem framework
 - **Respostas:** 12 buffers HTTP pré-montados no startup (6 score buckets × 2 approved/denied)
-- **SIMD:** AVX2 + FMA no hot path do k-NN (`target-cpu=haswell`, `+avx2,+fma`)
+- **SIMD:** AVX2 no hot path do k-NN (`target-cpu=haswell`, `+avx2,+fma`); kernel processa 8 vetores i16 → i32 por iteração com 4 acumuladores independentes
 
 ## Arquitetura
 
@@ -115,12 +115,12 @@ Pesos da fórmula de detecção: FP=1, FN=3, **HTTP error=5**. Em qualquer falha
 
 UDS sobre tmpfs falha com `ENOTSUP` no `bind(2)` quando o runner do smoke test cai no driver legacy do monoio (sem io_uring). TCP intra-bridge funciona em qualquer kernel/runner com overhead `~µs` no loopback Docker. Em produção real (kernel 6.x, io_uring nativo) o ganho de UDS é marginal versus o custo de portabilidade.
 
-### Por que f32 SoA?
+### Por que i16 SoA quantizado?
 
-- Espaço: 14 × 4 bytes × 3M = 168 MB. Cabe folgado em 350 MB.
-- Cache-friendly: dot product itera por dimensão; SoA mantém cada dimensão contígua.
-- AVX2/FMA: `_mm256_fmadd_ps` consome 8 lanes f32 por ciclo, sem desempacotamento.
-- Compatível com `f32::NAN` como sentinela de campo ausente.
+- Espaço: 14 × 2 bytes × 3M = **84 MB**. f32 (168 MB) não cabia em 170 MB de RAM por API → OOM kill no bench oficial.
+- Quantização: `round(f32 * 4096)`. Pós-normalização f32 ∈ `[-1, 1]` → i16 ∈ `[-4096, 4096]`. Erro de quantização ≈ 0.024%, irrelevante pra k-NN com k=5.
+- Cache-friendly: dot product itera por dimensão; SoA mantém cada dimensão contígua. Memory bandwidth cai pela metade vs f32.
+- AVX2: subtrai i16 (cabe no range), expande pra i32 com `_mm256_cvtepi16_epi32`, eleva ao quadrado com `_mm256_mullo_epi32`. Acumulador i32 cobre 14 dims sem overflow (max 940 M < 2.1 G).
 
 ### Por que respostas pré-montadas?
 
@@ -133,9 +133,9 @@ UDS sobre tmpfs falha com `ENOTSUP` no `bind(2)` quando o runner do smoke test c
 - [x] Normalização das 14 dimensões + sentinela `NaN`
 - [x] Tabela MCC + constantes embedded
 - [x] Parser HTTP manual + 12 respostas pré-montadas
-- [x] Dataset SoA f32 + mmap + label binário u8
+- [x] Dataset SoA i16 quantizado + mmap + label binário u8 (84 MB)
 - [x] KNN brute-force escalar baseline
-- [x] AVX2 + FMA dot product no hot path
+- [x] AVX2 i16 → i32 dot product no hot path
 - [x] Fallback `200 approved=true` em erro
 - [x] Imagem pública em `ghcr.io/tarcisiopgs/rinha-backend-2026:latest` com dataset embutido
 - [x] Branch `submission` + `docker-compose.yml` (TCP intra-bridge)
