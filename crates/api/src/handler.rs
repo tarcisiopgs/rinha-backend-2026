@@ -1,31 +1,36 @@
-//! Loop por conexão: lê → parseia → resolve → escreve. Buffer reusável.
+//! Loop por conexão: lê → parseia → normaliza → KNN → resposta pré-montada.
+//!
+//! Estratégia de erro: em qualquer falha (parse, normalização) devolvemos
+//! `200 OK approved=true fraud_score=0.0`. HTTP 5xx pesa 5× na pontuação;
+//! falso negativo pesa 3×; falso positivo pesa 1×. Devolver "aprovado" em
+//! caso de erro minimiza o pior caso esperado.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
-use bytes::{Bytes, BytesMut};
-use common::Dataset;
+use bytes::BytesMut;
+use common::normalize::NormalizationConfig;
+use common::{simd, Dataset, McCRiskTable};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::UnixStream;
 
 use crate::http::{self, ResponseTable, Route};
-use crate::knn;
+use crate::{json, knn};
 
 thread_local! {
     static RESPONSES: ResponseTable = ResponseTable::new();
+    static MCC: McCRiskTable = McCRiskTable::default();
+    static CFG: NormalizationConfig = NormalizationConfig::default();
 }
 
 const READ_BUF_INITIAL: usize = 4096;
 
-pub async fn serve_connection(stream: UnixStream, dataset: Rc<Dataset>) -> Result<()> {
+pub async fn serve_connection(mut stream: UnixStream, dataset: Rc<Dataset>) -> Result<()> {
     let mut buf = BytesMut::with_capacity(READ_BUF_INITIAL);
-    let stream = RefCell::new(stream);
 
     loop {
-        // Lê dados em bytes::BytesMut emprestado de volta pela API do monoio.
-        let read_buf = std::mem::replace(&mut buf, BytesMut::new());
-        let (res, returned) = stream.borrow_mut().read(read_buf).await;
+        let take = std::mem::replace(&mut buf, BytesMut::new());
+        let (res, returned) = stream.read(take).await;
         buf = returned;
         let n = res.context("read")?;
         if n == 0 {
@@ -39,7 +44,8 @@ pub async fn serve_connection(stream: UnixStream, dataset: Rc<Dataset>) -> Resul
                         Route::FraudScore => handle_fraud_score(&buf[req.body], &dataset),
                         Route::Ready => RESPONSES.with(ResponseTable::ready),
                     };
-                    write_all(&stream, response).await?;
+                    let (res, _) = stream.write_all(response).await;
+                    res.context("write")?;
                     let _ = buf.split_to(consumed);
                     if buf.is_empty() {
                         break;
@@ -48,12 +54,14 @@ pub async fn serve_connection(stream: UnixStream, dataset: Rc<Dataset>) -> Resul
                 Err(http::ParseError::Incomplete) => break,
                 Err(http::ParseError::Unsupported) => {
                     let response = RESPONSES.with(ResponseTable::not_found);
-                    write_all(&stream, response).await?;
+                    let (res, _) = stream.write_all(response).await;
+                    res.context("write")?;
                     return Ok(());
                 }
                 Err(_) => {
-                    let response = RESPONSES.with(ResponseTable::bad_request);
-                    write_all(&stream, response).await?;
+                    let response = RESPONSES.with(ResponseTable::fallback_approved);
+                    let (res, _) = stream.write_all(response).await;
+                    res.context("write")?;
                     return Ok(());
                 }
             }
@@ -61,72 +69,22 @@ pub async fn serve_connection(stream: UnixStream, dataset: Rc<Dataset>) -> Resul
     }
 }
 
-async fn write_all(stream: &RefCell<UnixStream>, response: Bytes) -> Result<()> {
-    let (res, _) = stream.borrow_mut().write_all(response).await;
-    res.context("write")?;
-    Ok(())
-}
+fn handle_fraud_score(body: &[u8], dataset: &Dataset) -> bytes::Bytes {
+    let mut known = Vec::new();
+    let parse_result = json::parse(body, &mut known);
 
-fn handle_fraud_score(body: &[u8], dataset: &Dataset) -> Bytes {
-    let Some(query) = parse_vector(body) else {
-        return RESPONSES.with(ResponseTable::bad_request);
+    let count = match parse_result {
+        Ok(view) => MCC.with(|mcc| {
+            CFG.with(|cfg| {
+                let raw = common::normalize::normalize(&view, cfg, mcc);
+                let q = simd::quantize(&raw);
+                knn::count_fraud_neighbors(&q, dataset)
+            })
+        }),
+        Err(_) => return RESPONSES.with(ResponseTable::fallback_approved),
     };
 
-    let bucket_idx = knn::predict_bucket(&query, dataset);
-    let approved = bucket_idx < 3; // 0.0, 0.2, 0.4 aprovam
-
-    RESPONSES.with(|r| r.fraud_score(bucket_idx, approved))
-}
-
-/// Parser JSON manual: extrai array `vector` de 14 floats.
-/// Aceita formato `{"vector":[v0,v1,...,v13]}` (whitespace tolerado).
-fn parse_vector(body: &[u8]) -> Option<[i16; common::DIM]> {
-    let bracket = memchr::memchr(b'[', body)?;
-    let close = memchr::memchr(b']', &body[bracket..])? + bracket;
-    let inner = &body[bracket + 1..close];
-
-    let mut out = [0_i16; common::DIM];
-    let mut idx = 0;
-    let mut start = 0;
-    let mut i = 0;
-    let scale = 8192.0_f32;
-
-    while i <= inner.len() {
-        if i == inner.len() || inner[i] == b',' {
-            let token = inner[start..i].trim_ascii();
-            if token.is_empty() {
-                return None;
-            }
-            let s = std::str::from_utf8(token).ok()?;
-            let v: f32 = s.parse().ok()?;
-            if idx >= common::DIM {
-                return None;
-            }
-            let q = (v * scale).round();
-            out[idx] = q.clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
-            idx += 1;
-            start = i + 1;
-        }
-        i += 1;
-    }
-
-    (idx == common::DIM).then_some(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_well_formed_vector() {
-        let body = br#"{"vector":[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]}"#;
-        let v = parse_vector(body).unwrap();
-        assert_eq!(v, [4096_i16; 14]);
-    }
-
-    #[test]
-    fn rejects_short_vector() {
-        let body = br#"{"vector":[0.5,0.5]}"#;
-        assert!(parse_vector(body).is_none());
-    }
+    let bucket = (count.min(5)) as usize;
+    let approved = f32::from(count) / 5.0 < common::APPROVED_THRESHOLD;
+    RESPONSES.with(|r| r.fraud_score(bucket, approved))
 }

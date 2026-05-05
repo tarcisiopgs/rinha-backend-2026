@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
 use monoio::net::{TcpListener, TcpStream, UnixStream};
 
 #[derive(Debug)]
@@ -42,17 +42,30 @@ fn main() -> Result<()> {
     let cfg = Config::from_env();
     tracing::info!(?cfg, "boot lb");
 
-    let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+    rt_block_on(serve(cfg))
+}
+
+#[cfg(target_os = "linux")]
+fn rt_block_on<F: std::future::Future<Output = Result<()>>>(fut: F) -> Result<()> {
+    monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
         .enable_timer()
         .build()
-        .context("init runtime")?;
+        .context("init monoio iouring runtime")?
+        .block_on(fut)
+}
 
-    rt.block_on(serve(cfg))
+#[cfg(not(target_os = "linux"))]
+fn rt_block_on<F: std::future::Future<Output = Result<()>>>(fut: F) -> Result<()> {
+    monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+        .enable_timer()
+        .build()
+        .context("init monoio legacy runtime")?
+        .block_on(fut)
 }
 
 async fn serve(cfg: Config) -> Result<()> {
-    let listener = TcpListener::bind(&cfg.listen)
-        .with_context(|| format!("bind tcp {}", cfg.listen))?;
+    let listener =
+        TcpListener::bind(&cfg.listen).with_context(|| format!("bind tcp {}", cfg.listen))?;
     tracing::info!(listen = %cfg.listen, upstreams = ?cfg.upstreams, "ouvindo");
 
     let counter = Rc::new(Cell::new(0_usize));

@@ -1,6 +1,8 @@
 //! Servidor da API. Single-threaded por instância, monoio + io_uring,
 //! escuta em UDS pra eliminar overhead de TCP loopback contra o LB.
 
+#![allow(unreachable_pub)]
+
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -9,6 +11,7 @@ use common::Dataset;
 
 mod handler;
 mod http;
+mod json;
 mod knn;
 
 #[derive(Debug)]
@@ -20,7 +23,7 @@ struct Config {
 impl Config {
     fn from_env() -> Self {
         let socket_path = std::env::var("API_SOCKET")
-            .unwrap_or_else(|_| "/tmp/api.sock".into())
+            .unwrap_or_else(|_| "/sockets/api.sock".into())
             .into();
         let dataset_path = std::env::var("DATASET_PATH")
             .unwrap_or_else(|_| "/data/references.bin".into())
@@ -48,12 +51,25 @@ fn main() -> Result<()> {
         .with_context(|| format!("abrir dataset em {}", cfg.dataset_path.display()))?;
     tracing::info!(n = dataset.len(), "dataset carregado");
 
-    let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+    rt_block_on(serve(cfg, Rc::new(dataset)))
+}
+
+#[cfg(target_os = "linux")]
+fn rt_block_on<F: std::future::Future<Output = Result<()>>>(fut: F) -> Result<()> {
+    monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
         .enable_timer()
         .build()
-        .context("inicializar runtime monoio")?;
+        .context("init monoio iouring runtime")?
+        .block_on(fut)
+}
 
-    rt.block_on(serve(cfg, Rc::new(dataset)))
+#[cfg(not(target_os = "linux"))]
+fn rt_block_on<F: std::future::Future<Output = Result<()>>>(fut: F) -> Result<()> {
+    monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+        .enable_timer()
+        .build()
+        .context("init monoio legacy runtime")?
+        .block_on(fut)
 }
 
 async fn serve(cfg: Config, dataset: Rc<Dataset>) -> Result<()> {

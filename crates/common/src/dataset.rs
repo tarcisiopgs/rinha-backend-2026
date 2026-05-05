@@ -1,30 +1,34 @@
-//! Dataset de referência quantizado i16 + score, layout SoA.
+//! Dataset de referência quantizado i16 SoA + label binário.
 //!
 //! Formato binário (little-endian):
 //! ```text
 //! HEADER (32 bytes)
-//!   magic         u32  = 0x52424B32 ("RBK2")
-//!   version       u32  = 1
-//!   dim           u32  = 14
-//!   n             u32  = 3_000_000
-//!   scale         f32  = 8192.0
-//!   _reserved     [u8; 12]
+//!   magic        u32  = 0x52424B32 ("RBK2")
+//!   version      u32  = 2
+//!   dim          u32  = 14
+//!   n            u32  = 3_000_000
+//!   scale        f32  = 8192.0
+//!   _reserved    [u8; 12]
 //!
-//! SCORES (n * 1 byte)        // u8 ∈ {0, 51, 102, 153, 204, 255} (0.0..=1.0 * 255)
-//! VECTORS_SOA (dim * n * 2 bytes)  // i16 column-major: dim 0 todos n, dim 1 todos n, ...
+//! LABELS  (n bytes)         // u8: 0 = legit, 1 = fraud
+//! VECTORS (DIM * n * 2 b)   // i16 SoA: dim 0 todos n, dim 1 todos n, ...
+//!                           // Sentinela `i16::MIN` = ausência de dado (-1 do payload).
 //! ```
 //!
-//! SoA + alinhamento 64 bytes acelera SIMD AVX2 e reduz cache miss.
+//! SoA + alinhamento natural acelera SIMD AVX2 e reduz cache miss em batch
+//! por dimensão. mmap deixa o kernel paginar sob demanda.
 
 use std::path::Path;
 
 use memmap2::Mmap;
 
-pub const DIM: usize = 14;
+use crate::proto::DIM;
+
 pub const MAGIC: u32 = 0x5242_4B32;
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const HEADER_SIZE: usize = 32;
-pub const DEFAULT_SCALE: f32 = 8192.0;
+pub const LABEL_LEGIT: u8 = 0;
+pub const LABEL_FRAUD: u8 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DatasetError {
@@ -34,7 +38,7 @@ pub enum DatasetError {
     #[error("magic inválido: esperado 0x{MAGIC:08X}, encontrado 0x{0:08X}")]
     BadMagic(u32),
 
-    #[error("versão não suportada: {0}")]
+    #[error("versão não suportada: esperado {VERSION}, encontrado {0}")]
     BadVersion(u32),
 
     #[error("dim inesperado: esperado {DIM}, encontrado {0}")]
@@ -44,27 +48,20 @@ pub enum DatasetError {
     Truncated { expected: usize, actual: usize },
 }
 
-/// Dataset memory-mapped, somente leitura.
-///
-/// Carregamento O(1): apenas mapeia o arquivo. Páginas são paginadas sob demanda
-/// pelo kernel — primeira passada de busca toca tudo, subsequentes ficam em RSS.
 #[derive(Debug)]
 pub struct Dataset {
     _mmap: Mmap,
     n: usize,
     scale: f32,
-    scores: *const u8,
-    /// Ponteiro pra início da matriz SoA. Indexação: `vectors[d * n + i]`.
+    labels: *const u8,
     vectors: *const i16,
 }
 
-// SAFETY: ponteiros apontam pra mmap imutável que sobrevive a Self via _mmap.
-// Sem mutação concorrente possível (somente leitura).
+// SAFETY: mmap imutável compartilhada; ponteiros vivem enquanto _mmap vive.
 unsafe impl Send for Dataset {}
 unsafe impl Sync for Dataset {}
 
 impl Dataset {
-    /// Abre dataset binário pré-processado via mmap.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DatasetError> {
         let file = std::fs::File::open(path)?;
         // SAFETY: arquivo não será modificado durante o tempo de vida do Dataset.
@@ -77,26 +74,26 @@ impl Dataset {
             });
         }
 
-        let magic = u32::from_le_bytes(mmap[0..4].try_into().expect("4 bytes"));
+        let magic = u32::from_le_bytes(mmap[0..4].try_into().unwrap());
         if magic != MAGIC {
             return Err(DatasetError::BadMagic(magic));
         }
 
-        let version = u32::from_le_bytes(mmap[4..8].try_into().expect("4 bytes"));
+        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
         if version != VERSION {
             return Err(DatasetError::BadVersion(version));
         }
 
-        let dim = u32::from_le_bytes(mmap[8..12].try_into().expect("4 bytes"));
+        let dim = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
         if dim as usize != DIM {
             return Err(DatasetError::BadDim(dim));
         }
 
-        let n = u32::from_le_bytes(mmap[12..16].try_into().expect("4 bytes")) as usize;
-        let scale = f32::from_le_bytes(mmap[16..20].try_into().expect("4 bytes"));
+        let n = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
+        let scale = f32::from_le_bytes(mmap[16..20].try_into().unwrap());
 
-        let scores_off = HEADER_SIZE;
-        let vectors_off = scores_off + n;
+        let labels_off = HEADER_SIZE;
+        let vectors_off = labels_off + n;
         let expected = vectors_off + DIM * n * std::mem::size_of::<i16>();
 
         if mmap.len() < expected {
@@ -106,14 +103,14 @@ impl Dataset {
             });
         }
 
-        let scores = unsafe { mmap.as_ptr().add(scores_off) };
+        let labels = unsafe { mmap.as_ptr().add(labels_off) };
         let vectors = unsafe { mmap.as_ptr().add(vectors_off).cast::<i16>() };
 
         Ok(Self {
             _mmap: mmap,
             n,
             scale,
-            scores,
+            labels,
             vectors,
         })
     }
@@ -136,25 +133,24 @@ impl Dataset {
         self.scale
     }
 
-    /// Score quantizado u8 ∈ [0, 255]. Multiplicar por `1.0 / 255.0` pra obter f32.
+    /// `true` se vetor `i` é fraude.
     #[inline]
     #[must_use]
-    pub fn score_u8(&self, i: usize) -> u8 {
+    pub fn is_fraud(&self, i: usize) -> bool {
         debug_assert!(i < self.n);
-        // SAFETY: i validado por debug_assert; release confia no chamador.
-        unsafe { *self.scores.add(i) }
+        // SAFETY: i validado por debug_assert.
+        unsafe { *self.labels.add(i) == LABEL_FRAUD }
     }
 
-    /// Slice contíguo de uma dimensão. Tamanho = n.
+    /// Slice contíguo da dimensão `d`. Tamanho = `n`.
     #[inline]
     #[must_use]
     pub fn dim_column(&self, d: usize) -> &[i16] {
         debug_assert!(d < DIM);
-        // SAFETY: matriz SoA tem DIM colunas de tamanho n; d validado.
+        // SAFETY: matriz SoA tem DIM colunas de tamanho n.
         unsafe { std::slice::from_raw_parts(self.vectors.add(d * self.n), self.n) }
     }
 
-    /// Ponteiro raw pra início da matriz SoA. Uso em hot path SIMD.
     #[inline]
     #[must_use]
     pub fn vectors_ptr(&self) -> *const i16 {

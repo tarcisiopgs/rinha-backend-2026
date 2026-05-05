@@ -1,17 +1,16 @@
-//! Busca k-NN brute-force sobre dataset SoA. Retorna bucket de score agregado.
+//! Busca k-NN brute-force sobre dataset SoA. Retorna count de fraudes entre
+//! os K mais próximos.
 //!
-//! Brute-force varre n=3M vetores por request. AVX2 + SoA permite ~16 dot
-//! products i16 por ciclo. Para cair abaixo de 1ms precisamos provavelmente
-//! migrar pra IVF (ver `roadmap` no README) — esta primeira versão é o baseline.
+//! Brute-force varre n=3M vetores. Baseline escalar — substituir por AVX2
+//! ou IVF index quando profile confirmar bottleneck.
 
-use common::proto::{K, SCORE_BUCKETS};
+use common::proto::K;
 use common::{Dataset, DIM};
 
-/// Heap min de tamanho fixo K (top-K menores distâncias).
 #[derive(Debug, Clone, Copy)]
 struct TopK {
     dists: [i64; K],
-    indices: [usize; K],
+    indices: [u32; K],
     len: usize,
 }
 
@@ -24,10 +23,8 @@ impl TopK {
         }
     }
 
-    /// Insere `(dist, idx)` se for menor que o maior atual. O(K) por insert,
-    /// K=5 fixo => competitivo vs heap binário pra K pequeno.
     #[inline]
-    fn try_push(&mut self, dist: i64, idx: usize) {
+    fn try_push(&mut self, dist: i64, idx: u32) {
         if self.len < K {
             self.dists[self.len] = dist;
             self.indices[self.len] = idx;
@@ -49,11 +46,11 @@ impl TopK {
     }
 }
 
-/// Calcula bucket de score do query (índice em `SCORE_BUCKETS`).
+/// Conta quantos dos K vizinhos mais próximos são `fraud`.
 ///
-/// Estratégia atual: brute-force escalar — substituir por AVX2 quando profile
-/// confirmar bottleneck no dot product.
-pub fn predict_bucket(query: &[i16; DIM], dataset: &Dataset) -> usize {
+/// Returns valor em `0..=K` que mapeia diretamente em
+/// `fraud_score = count / 5.0` (= bucket index em `SCORE_BUCKETS`).
+pub fn count_fraud_neighbors(query: &[i16; DIM], dataset: &Dataset) -> u8 {
     let mut top = TopK::new();
     let n = dataset.len();
 
@@ -62,35 +59,21 @@ pub fn predict_bucket(query: &[i16; DIM], dataset: &Dataset) -> usize {
     for i in 0..n {
         let mut acc: i64 = 0;
         for d in 0..DIM {
-            // SAFETY: i < n e cada coluna tem len = n.
+            // SAFETY: cada coluna tem len = n; i < n.
             let v = unsafe { *columns[d].get_unchecked(i) };
             let diff = i32::from(query[d]) - i32::from(v);
-            acc += i64::from(diff * diff);
+            acc += i64::from(diff) * i64::from(diff);
         }
-        top.try_push(acc, i);
+        top.try_push(acc, i as u32);
     }
 
-    let mut sum_score = 0_u32;
-    for i in 0..top.len {
-        sum_score += u32::from(dataset.score_u8(top.indices[i]));
-    }
-    let mean = (sum_score as f32) / (top.len.max(1) as f32) / 255.0;
-
-    nearest_bucket(mean)
-}
-
-#[inline]
-fn nearest_bucket(score: f32) -> usize {
-    let mut best = 0_usize;
-    let mut best_dist = (score - SCORE_BUCKETS[0]).abs();
-    for (i, &b) in SCORE_BUCKETS.iter().enumerate().skip(1) {
-        let d = (score - b).abs();
-        if d < best_dist {
-            best_dist = d;
-            best = i;
+    let mut count = 0_u8;
+    for slot in 0..top.len {
+        if dataset.is_fraud(top.indices[slot] as usize) {
+            count += 1;
         }
     }
-    best
+    count
 }
 
 #[cfg(test)]
@@ -101,18 +84,10 @@ mod tests {
     fn topk_keeps_smallest_k() {
         let mut t = TopK::new();
         for (i, d) in [10_i64, 1, 50, 3, 8, 2, 100].iter().enumerate() {
-            t.try_push(*d, i);
+            t.try_push(*d, i as u32);
         }
         let mut dists = t.dists;
         dists.sort_unstable();
         assert_eq!(dists, [1, 2, 3, 8, 10]);
-    }
-
-    #[test]
-    fn nearest_bucket_snaps_correctly() {
-        assert_eq!(nearest_bucket(0.0), 0);
-        assert_eq!(nearest_bucket(0.19), 1);
-        assert_eq!(nearest_bucket(0.5), 2); // empate vai pro primeiro encontrado (0.4)
-        assert_eq!(nearest_bucket(1.0), 5);
     }
 }

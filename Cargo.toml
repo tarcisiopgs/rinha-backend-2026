@@ -17,7 +17,7 @@ repository = "https://github.com/tarcisiopgs/rinha-backend-2026"
 [workspace.dependencies]
 common = { path = "crates/common" }
 
-monoio = { version = "0.2", features = ["sync", "iouring", "bytes"] }
+monoio = { version = "0.2", features = ["sync", "iouring", "legacy", "bytes"] }
 bytes = "1.8"
 memchr = "2.7"
 itoa = "1.0"
@@ -42,16 +42,12 @@ missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-perf = { level = "deny", priority = 0 }
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }
+perf = { level = "deny", priority = -1 }
 redundant_clone = "deny"
 needless_collect = "deny"
 large_enum_variant = "warn"
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
 
 [profile.release]
 opt-level = 3

@@ -32,8 +32,6 @@ pub struct Request {
     pub body: Range<usize>,
 }
 
-/// Tenta parsear uma request a partir do buffer. Retorna `Incomplete` se
-/// faltar dados — chamador deve ler mais do socket.
 pub fn parse(buf: &[u8]) -> Result<(Request, usize), ParseError> {
     let header_end = memchr::memmem::find(buf, b"\r\n\r\n").ok_or(ParseError::Incomplete)?;
     let header = &buf[..header_end];
@@ -53,7 +51,9 @@ pub fn parse(buf: &[u8]) -> Result<(Request, usize), ParseError> {
     };
 
     let content_length = match route {
-        Route::FraudScore => parse_content_length(header)?.ok_or(ParseError::MissingContentLength)?,
+        Route::FraudScore => {
+            parse_content_length(header)?.ok_or(ParseError::MissingContentLength)?
+        }
         Route::Ready => 0,
     };
 
@@ -74,20 +74,14 @@ pub fn parse(buf: &[u8]) -> Result<(Request, usize), ParseError> {
 
 fn parse_content_length(header: &[u8]) -> Result<Option<usize>, ParseError> {
     const KEY: &[u8] = b"content-length:";
-    let mut start = 0;
-    while let Some(eol) = memchr::memmem::find(&header[start..], b"\r\n") {
-        let line_start = start;
-        let line = &header[line_start..line_start + eol];
-        start += eol + 2;
-
+    for line in header.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.len() < KEY.len() {
             continue;
         }
-        let key = &line[..KEY.len()];
-        if !key.eq_ignore_ascii_case(KEY) {
+        if !line[..KEY.len()].eq_ignore_ascii_case(KEY) {
             continue;
         }
-
         let value = line[KEY.len()..].trim_ascii();
         let s = std::str::from_utf8(value).map_err(|_| ParseError::Malformed)?;
         let n: usize = s.parse().map_err(|_| ParseError::Malformed)?;
@@ -96,13 +90,14 @@ fn parse_content_length(header: &[u8]) -> Result<Option<usize>, ParseError> {
     Ok(None)
 }
 
-/// Respostas HTTP pré-montadas. Score só pode assumir 6 valores (`SCORE_BUCKETS`),
-/// então pré-construímos os 12 buffers (6 buckets × {approved, denied}).
+/// Tabela de respostas HTTP pré-montadas. Score só pode assumir 6 valores
+/// discretos (`SCORE_BUCKETS`), então pré-construímos os 12 buffers (6 buckets
+/// × {approved, denied}).
 pub struct ResponseTable {
     fraud_score: [Bytes; 12],
     ready: Bytes,
     not_found: Bytes,
-    bad_request: Bytes,
+    fallback_approved: Bytes,
 }
 
 impl std::fmt::Debug for ResponseTable {
@@ -116,10 +111,11 @@ impl ResponseTable {
         let mut fraud_score: [Bytes; 12] = std::array::from_fn(|_| Bytes::new());
         for bucket in 0..6_usize {
             for &approved in &[false, true] {
-                let score = common::proto::SCORE_BUCKETS[bucket];
+                let score = common::SCORE_BUCKETS[bucket];
                 let body = format!(
                     "{{\"approved\":{},\"fraud_score\":{}}}",
-                    approved, score
+                    approved,
+                    format_score(score)
                 );
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
@@ -131,6 +127,13 @@ impl ResponseTable {
             }
         }
 
+        let fallback_body = "{\"approved\":true,\"fraud_score\":0.0}";
+        let fallback = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+            fallback_body.len(),
+            fallback_body
+        );
+
         Self {
             fraud_score,
             ready: Bytes::from_static(
@@ -139,9 +142,7 @@ impl ResponseTable {
             not_found: Bytes::from_static(
                 b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
             ),
-            bad_request: Bytes::from_static(
-                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            ),
+            fallback_approved: Bytes::from(fallback.into_bytes()),
         }
     }
 
@@ -161,15 +162,32 @@ impl ResponseTable {
         self.not_found.clone()
     }
 
+    /// Resposta padrão em caso de erro de parsing/normalização.
+    /// Devolve `200 approved=true fraud_score=0.0` pra evitar HTTP 5xx
+    /// (peso 5 na fórmula de detecção, vs FN peso 3).
     #[inline]
-    pub fn bad_request(&self) -> Bytes {
-        self.bad_request.clone()
+    pub fn fallback_approved(&self) -> Bytes {
+        self.fallback_approved.clone()
     }
 }
 
 impl Default for ResponseTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn format_score(score: f32) -> &'static str {
+    // SCORE_BUCKETS são valores discretos conhecidos — formato fixo no JSON
+    // de resposta evita chamadas a `ryu`/`format!` em hot path.
+    match (score * 10.0).round() as i32 {
+        0 => "0.0",
+        2 => "0.2",
+        4 => "0.4",
+        6 => "0.6",
+        8 => "0.8",
+        10 => "1.0",
+        _ => "0.0",
     }
 }
 
@@ -199,5 +217,16 @@ mod tests {
     fn parse_incomplete_returns_err() {
         let raw = b"POST /fraud-score HTTP/1.1\r\nContent-Length:";
         assert!(matches!(parse(raw), Err(ParseError::Incomplete)));
+    }
+
+    #[test]
+    fn response_table_builds_all_buckets() {
+        let t = ResponseTable::new();
+        for bucket in 0..6 {
+            for approved in [false, true] {
+                let r = t.fraud_score(bucket, approved);
+                assert!(r.starts_with(b"HTTP/1.1 200 OK"));
+            }
+        }
     }
 }
