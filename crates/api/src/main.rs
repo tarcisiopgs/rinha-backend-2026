@@ -1,10 +1,11 @@
-//! Servidor da API em tokio + hyper. Single OS thread (multi_thread runtime
-//! com `worker_threads=1`) — compatível com o orçamento de 1 CPU do desafio.
-//! O cgroup do compose enforça o limite real; tokio só decide concorrência
-//! cooperativa em cima desse worker.
+//! Servidor da API em tokio + hyper. Single-thread runtime (`current_thread`
+//! flavor) — escopo 1 CPU exato, sem overhead do work-stealing scheduler do
+//! multi_thread. Inspiração na config do lothyriel/rinha_2026 que passou no
+//! Mac Mini Late 2014.
 
 #![allow(unreachable_pub)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -72,9 +73,7 @@ fn main() -> Result<()> {
     let dataset = Arc::new(dataset);
     let responses = Arc::new(responses::ResponseTable::new());
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .max_blocking_threads(1)
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("init tokio runtime")?;
@@ -96,12 +95,22 @@ async fn serve(
             accept_tcp(listener, dataset, responses).await
         }
         Listen::Uds(path) => {
-            if path.exists() {
-                std::fs::remove_file(&path)
-                    .with_context(|| format!("remover socket stale {}", path.display()))?;
+            // Mesmo handling que lothyriel/rinha_2026 (passou no Mac Mini):
+            // garante diretório, ignora NotFound no remove, bind, e seta
+            // permissões 0666 pra haproxy (em outro container) conseguir
+            // acessar o socket pelo volume compartilhado.
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create_dir_all {}", parent.display()))?;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("rm stale {}", path.display())),
             }
             let listener = UnixListener::bind(&path)
                 .with_context(|| format!("bind UDS em {}", path.display()))?;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
             tracing::info!(uds = %path.display(), "ouvindo");
             accept_uds(listener, dataset, responses).await
         }
