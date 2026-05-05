@@ -8,12 +8,11 @@ services:
     image: rinha-2026:latest
     entrypoint: ["/usr/local/bin/api"]
     environment:
-      API_SOCKET: /sockets/api1.sock
+      API_LISTEN: tcp:0.0.0.0:9000
       DATASET_PATH: /data/references.bin
       RUST_LOG: warn
     volumes:
       - ./data:/data:ro
-      - sockets:/sockets
     deploy:
       resources:
         limits:
@@ -29,12 +28,11 @@ services:
     image: rinha-2026:latest
     entrypoint: ["/usr/local/bin/api"]
     environment:
-      API_SOCKET: /sockets/api2.sock
+      API_LISTEN: tcp:0.0.0.0:9000
       DATASET_PATH: /data/references.bin
       RUST_LOG: warn
     volumes:
       - ./data:/data:ro
-      - sockets:/sockets
     deploy:
       resources:
         limits:
@@ -48,15 +46,13 @@ services:
     entrypoint: ["/usr/local/bin/lb"]
     environment:
       LB_LISTEN: 0.0.0.0:9999
-      LB_UPSTREAMS: /sockets/api1.sock,/sockets/api2.sock
+      LB_UPSTREAMS: tcp:api1:9000,tcp:api2:9000
       RUST_LOG: warn
     ports:
       - "9999:9999"
     depends_on:
       - api1
       - api2
-    volumes:
-      - sockets:/sockets
     deploy:
       resources:
         limits:
@@ -64,14 +60,6 @@ services:
           memory: "10MB"
     networks:
       - rinha
-
-volumes:
-  sockets:
-    driver: local
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
-      o: "size=10m"
 
 networks:
   rinha:
