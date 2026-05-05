@@ -71,6 +71,16 @@ make preprocess  # gera data/references.bin (uma vez)
 make run         # docker compose up --build
 ```
 
+### Dev em Apple Silicon (Docker Desktop)
+
+QEMU em Apple Silicon não emula AVX2 corretamente (autovec do `f32` div gera bits garbage) e Docker Desktop bloqueia `io_uring_setup` via seccomp. Use o override `docker-compose.dev.yml`:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```
+
+Override desliga `target-cpu=haswell`, força `MONOIO_DRIVER=legacy` e troca UDS por TCP loopback (volume Docker Desktop não suporta bind UDS). A imagem de submissão (sem override) mantém AVX2 + io_uring + UDS.
+
 ### Validação manual
 
 ```bash

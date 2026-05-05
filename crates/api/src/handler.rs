@@ -12,7 +12,7 @@ use bytes::BytesMut;
 use common::normalize::NormalizationConfig;
 use common::{simd, Dataset, McCRiskTable};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use monoio::net::UnixStream;
+use monoio::net::{TcpStream, UnixStream};
 
 use crate::http::{self, ResponseTable, Route};
 use crate::{json, knn};
@@ -25,7 +25,18 @@ thread_local! {
 
 const READ_BUF_INITIAL: usize = 4096;
 
-pub async fn serve_connection(mut stream: UnixStream, dataset: Rc<Dataset>) -> Result<()> {
+pub async fn serve_uds(stream: UnixStream, dataset: Rc<Dataset>) -> Result<()> {
+    serve_loop(stream, dataset).await
+}
+
+pub async fn serve_tcp(stream: TcpStream, dataset: Rc<Dataset>) -> Result<()> {
+    serve_loop(stream, dataset).await
+}
+
+async fn serve_loop<S>(mut stream: S, dataset: Rc<Dataset>) -> Result<()>
+where
+    S: AsyncReadRent + AsyncWriteRentExt,
+{
     let mut buf = BytesMut::with_capacity(READ_BUF_INITIAL);
 
     loop {

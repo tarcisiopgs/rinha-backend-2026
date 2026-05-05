@@ -1,0 +1,37 @@
+# Override pra Docker Desktop em macOS — usa TCP entre LB e APIs porque
+# volumes do Docker Desktop não suportam bind UDS, e force MONOIO_DRIVER=legacy
+# (Docker Desktop seccomp bloqueia io_uring_setup).
+#
+# Uso: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  api1:
+    build:
+      args:
+        RUSTFLAGS: "-C opt-level=3"
+    environment:
+      API_LISTEN: tcp:0.0.0.0:8001
+      MONOIO_DRIVER: legacy
+      RUST_LOG: info
+    expose:
+      - "8001"
+
+  api2:
+    build:
+      args:
+        RUSTFLAGS: "-C opt-level=3"
+    environment:
+      API_LISTEN: tcp:0.0.0.0:8002
+      MONOIO_DRIVER: legacy
+      RUST_LOG: info
+    expose:
+      - "8002"
+
+  lb:
+    build:
+      args:
+        RUSTFLAGS: "-C opt-level=3"
+    environment:
+      LB_UPSTREAMS: tcp:api1:8001,tcp:api2:8002
+      MONOIO_DRIVER: legacy
+      RUST_LOG: info
