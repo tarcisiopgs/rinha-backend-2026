@@ -4,9 +4,9 @@ name: rinha-2026
 # (linux/amd64, RUSTFLAGS=-C target-cpu=haswell -C target-feature=+avx2,+fma,
 # dataset embutido em /data/references.bin).
 #
-# Total: 1 CPU, 350 MB. 2 APIs com 0.40 CPU / 170 MB cada + LB com 0.20 CPU
-# / 10 MB. Engine da Rinha bate na porta 9999 (LB). Comunicação api↔lb via
-# TCP loopback intra-bridge (UDS sobre tmpfs falha em runners sem io_uring).
+# Total: 1 CPU, 350 MB. 2 APIs com 0.40 CPU / 160 MB cada + LB com 0.20 CPU
+# / 30 MB. LB precisa de mais headroom porque sob 250 VUs concorrentes do k6
+# o pump aloca 250×2 buffers de 8KB + monoio runtime stack — 10 MB era OOM.
 
 services:
   api1:
@@ -21,7 +21,7 @@ services:
       resources:
         limits:
           cpus: "0.40"
-          memory: "170MB"
+          memory: "160MB"
     networks:
       - rinha
 
@@ -37,7 +37,7 @@ services:
       resources:
         limits:
           cpus: "0.40"
-          memory: "170MB"
+          memory: "160MB"
     networks:
       - rinha
 
@@ -58,7 +58,7 @@ services:
       resources:
         limits:
           cpus: "0.20"
-          memory: "10MB"
+          memory: "30MB"
     networks:
       - rinha
 
