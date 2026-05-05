@@ -30,6 +30,7 @@ pub enum Route {
 pub struct Request {
     pub route: Route,
     pub body: Range<usize>,
+    pub keep_alive: bool,
 }
 
 pub fn parse(buf: &[u8]) -> Result<(Request, usize), ParseError> {
@@ -42,7 +43,7 @@ pub fn parse(buf: &[u8]) -> Result<(Request, usize), ParseError> {
     let mut parts = request_line.splitn(3, |&b| b == b' ');
     let method = parts.next().ok_or(ParseError::Malformed)?;
     let path = parts.next().ok_or(ParseError::Malformed)?;
-    let _version = parts.next().ok_or(ParseError::Malformed)?;
+    let version = parts.next().ok_or(ParseError::Malformed)?;
 
     let route = match (method, path) {
         (b"POST", b"/fraud-score") => Route::FraudScore,
@@ -63,13 +64,56 @@ pub fn parse(buf: &[u8]) -> Result<(Request, usize), ParseError> {
         return Err(ParseError::Incomplete);
     }
 
+    let keep_alive = derive_keep_alive(version, header);
+
     Ok((
         Request {
             route,
             body: body_start..body_end,
+            keep_alive,
         },
         body_end,
     ))
+}
+
+/// HTTP/1.1 default = keep-alive a menos que tenha `Connection: close`.
+/// HTTP/1.0 default = close a menos que tenha `Connection: keep-alive`.
+fn derive_keep_alive(version: &[u8], header: &[u8]) -> bool {
+    let conn = parse_connection_header(header);
+    let is_http_1_0 = version.eq_ignore_ascii_case(b"HTTP/1.0");
+    match conn {
+        Some(ConnectionToken::Close) => false,
+        Some(ConnectionToken::KeepAlive) => true,
+        None => !is_http_1_0,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConnectionToken {
+    KeepAlive,
+    Close,
+}
+
+fn parse_connection_header(header: &[u8]) -> Option<ConnectionToken> {
+    const KEY: &[u8] = b"connection:";
+    for line in header.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.len() < KEY.len() {
+            continue;
+        }
+        if !line[..KEY.len()].eq_ignore_ascii_case(KEY) {
+            continue;
+        }
+        let value = line[KEY.len()..].trim_ascii();
+        if value.eq_ignore_ascii_case(b"close") {
+            return Some(ConnectionToken::Close);
+        }
+        if value.eq_ignore_ascii_case(b"keep-alive") {
+            return Some(ConnectionToken::KeepAlive);
+        }
+        return None;
+    }
+    None
 }
 
 fn parse_content_length(header: &[u8]) -> Result<Option<usize>, ParseError> {
@@ -202,6 +246,7 @@ mod tests {
         assert_eq!(req.route, Route::FraudScore);
         assert_eq!(&raw[req.body], b"hello");
         assert_eq!(n, raw.len());
+        assert!(req.keep_alive);
     }
 
     #[test]
@@ -211,6 +256,28 @@ mod tests {
         assert_eq!(req.route, Route::Ready);
         assert_eq!(req.body.len(), 0);
         assert_eq!(n, raw.len());
+        assert!(req.keep_alive);
+    }
+
+    #[test]
+    fn http10_default_close() {
+        let raw = b"GET /ready HTTP/1.0\r\nHost: x\r\n\r\n";
+        let (req, _) = parse(raw).unwrap();
+        assert!(!req.keep_alive);
+    }
+
+    #[test]
+    fn http10_explicit_keep_alive() {
+        let raw = b"GET /ready HTTP/1.0\r\nConnection: keep-alive\r\nHost: x\r\n\r\n";
+        let (req, _) = parse(raw).unwrap();
+        assert!(req.keep_alive);
+    }
+
+    #[test]
+    fn http11_explicit_close() {
+        let raw = b"GET /ready HTTP/1.1\r\nConnection: close\r\nHost: x\r\n\r\n";
+        let (req, _) = parse(raw).unwrap();
+        assert!(!req.keep_alive);
     }
 
     #[test]

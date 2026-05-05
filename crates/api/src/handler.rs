@@ -63,8 +63,12 @@ where
                         Route::FraudScore => handle_fraud_score(&buf[req.body], &dataset),
                         Route::Ready => RESPONSES.with(ResponseTable::ready),
                     };
+                    let keep_alive = req.keep_alive;
                     let (res, _) = stream.write_all(response).await;
                     res.context("write")?;
+                    if !keep_alive {
+                        return Ok(());
+                    }
                     buf.drain(..consumed);
                     if buf.is_empty() {
                         break;
